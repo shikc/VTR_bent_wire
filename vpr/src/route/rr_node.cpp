@@ -120,6 +120,9 @@ float t_rr_node::C() const {
     auto& device_ctx = g_vpr_ctx.device();
     return device_ctx.rr_rc_data[rc_index()].C;
 }
+bool t_rr_node::is_bend_first() const {
+    return is_bend_first_node;
+}
 
 bool t_rr_node::validate() const {
     //Check internal assumptions about RR node are valid
@@ -304,6 +307,9 @@ void t_rr_node::set_side(e_side new_side) {
         VPR_THROW(VPR_ERROR_ROUTE, "Attempted to set RR node 'side' for non-channel type '%s'", type_string());
     }
     dir_side_.side = new_side;
+}
+void t_rr_node::set_bend_first_node(bool is_bend_first) {
+    is_bend_first_node = is_bend_first;
 }
 
 void t_rr_node::set_edge_sink_node(short iedge, int sink_node) {

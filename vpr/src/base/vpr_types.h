@@ -1002,6 +1002,7 @@ struct t_det_routing_arch {
 
     short global_route_switch;
     short delayless_switch;
+    short bend_delayless_switch;
     int wire_to_arch_ipin_switch;
     int wire_to_rr_ipin_switch;
     float R_minW_nmos;
@@ -1020,6 +1021,13 @@ enum e_direction : unsigned char {
 };
 
 constexpr std::array<const char*, NUM_DIRECTIONS> DIRECTION_STRING = {{"INC_DIRECTION", "DEC_DIRECTION", "BI_DIRECTION", "NO_DIRECTION"}};
+
+enum e_switch_dir_type {
+    UP_TYPE,
+    DOWN_TYPE,
+    NORMAL_TYPE
+};
+
 
 /* Lists detailed information about segmentation.  [0 .. W-1].              *
  * length:  length of segment.                                              *
@@ -1053,6 +1061,8 @@ struct t_seg_details {
     std::unique_ptr<bool[]> cb;
     short arch_wire_switch = 0;
     short arch_opin_switch = 0;
+    short first_wire_switch = 0;
+    short first_opin_switch = 0;
     float Rmetal = 0;
     float Cmetal = 0;
     bool twisted = 0;
@@ -1062,8 +1072,13 @@ struct t_seg_details {
     int seg_start = 0;
     int seg_end = 0;
     int index = 0;
+    int cost_index;  
     float Cmetal_per_m = 0; /* Used for power */
     std::string type_name;
+    int part_idx; /* Used for bend segment type */
+    enum e_switch_dir_type switch_dir_type;
+    int bend_len;
+
 };
 
 class t_chan_seg_details {
@@ -1099,6 +1114,13 @@ class t_chan_seg_details {
     int index() const { return seg_detail_->index; }
 
     std::string type_name() const { return seg_detail_->type_name; }
+    short first_wire_switch() const { return seg_detail_->first_wire_switch; }
+    short first_opin_switch() const { return seg_detail_->first_opin_switch; }
+    int cost_index() const { return seg_detail_->cost_index; }
+    int part_idx() const { return seg_detail_->part_idx; }
+    e_switch_dir_type switch_dir_type() const { return seg_detail_->switch_dir_type; }
+    int bend_len() const { return seg_detail_->bend_len; }
+
 
   public: //Modifiers
     void set_length(int new_len) { length_ = new_len; }

@@ -150,6 +150,7 @@ static void ProcessSegments(pugi::xml_node Parent,
                             const bool timing_enabled,
                             const bool switchblocklist_required,
                             const pugiutil::loc_data& loc_data);
+static void ProcessBend(pugi::xml_node Node, std::vector<int>& list, bool& isbend, const int len, const pugiutil::loc_data& loc_data);
 static void ProcessSwitchblocks(pugi::xml_node Parent, t_arch* arch, const pugiutil::loc_data& loc_data);
 static void ProcessCB_SB(pugi::xml_node Node, std::vector<bool>& list, const pugiutil::loc_data& loc_data);
 static void ProcessPower(pugi::xml_node parent,
@@ -2809,6 +2810,7 @@ static void ProcessSegments(pugi::xml_node Parent,
 
             //Unidir requires the following tags
             expected_subtags.push_back("mux");
+            expected_subtags.push_back("bend");
         }
 
         else {
@@ -2893,6 +2895,14 @@ static void ProcessSegments(pugi::xml_node Parent,
         if (SubElem) {
             ProcessCB_SB(SubElem, Segs[i].sb, loc_data);
         }
+        if (length > 1) {
+            Segs[i].isbend = false;
+            SubElem = get_single_child(Node, "bend", loc_data, OPTIONAL);
+            if (SubElem) {
+                ProcessBend(SubElem, Segs[i].bend, Segs[i].isbend, (length - 1), loc_data);
+            }
+        }
+
 
         /* Get next Node */
         Node = Node.next_sibling(Node.name());
@@ -2947,8 +2957,14 @@ static void ProcessSwitchblocks(pugi::xml_node Parent, t_arch* arch, const pugiu
                 sb.location = E_CORE;
             } else if (strcmp(tmp, "CORNER") == 0) {
                 sb.location = E_CORNER;
-            } else if (strcmp(tmp, "FRINGE") == 0) {
-                sb.location = E_FRINGE;
+            } else if (strcmp(tmp, "FRINGE_LEFT") == 0) {
+                sb.location = E_FRINGE_LEFT;
+            } else if (strcmp(tmp, "FRINGE_RIGHT") == 0) {
+                sb.location = E_FRINGE_RIGHT;
+            } else if (strcmp(tmp, "FRINGE_TOP") == 0) {
+                sb.location = E_FRINGE_TOP;
+            } else if (strcmp(tmp, "FRINGE_BOTTOM") == 0) {
+                sb.location = E_FRINGE_BOTTOM;
             } else {
                 archfpga_throw(loc_data.filename_c_str(), loc_data.line(SubElem), "unrecognized switchblock location: %s\n", tmp);
             }
@@ -2971,6 +2987,63 @@ static void ProcessSwitchblocks(pugi::xml_node Parent, t_arch* arch, const pugiu
 
     return;
 }
+
+static void ProcessBend(pugi::xml_node Node, std::vector<int>& list, bool& isbend, const int len, const pugiutil::loc_data& loc_data) {
+    const char* tmp = nullptr;
+    int i;
+
+    tmp = get_attribute(Node, "type", loc_data).value();
+    if (0 == strcmp(tmp, "pattern")) {
+        i = 0;
+
+        /* Get the content string */
+        tmp = Node.child_value();
+        while (*tmp) {
+            switch (*tmp) {
+                case ' ':
+                case '\t':
+                case '\n':
+                    break;
+                case '-':
+                    list.push_back(0);
+                    break;
+                case 'U':
+                    list.push_back(1);
+                    isbend = true;
+                    break;
+                case 'D':
+                    list.push_back(2);
+                    isbend = true;
+                    break;
+                case 'B':
+                    archfpga_throw(loc_data.filename_c_str(), loc_data.line(Node),
+                                   "B pattern is not supported in current version\n",
+                                   *tmp);
+                    //                    list.push_back(3);
+                    //                    isbend = true;
+                    break;
+                default:
+                    archfpga_throw(loc_data.filename_c_str(), loc_data.line(Node),
+                                   "Invalid character %c in CB or SB depopulation list.\n",
+                                   *tmp);
+            }
+            ++tmp;
+        }
+
+        if (list.size() != size_t(len)) {
+            archfpga_throw(loc_data.filename_c_str(), loc_data.line(Node),
+                           "Wrong length of bend list (%d). Expect %d symbols.\n",
+                           i, len);
+        }
+    }
+
+    else {
+        archfpga_throw(loc_data.filename_c_str(), loc_data.line(Node),
+                       "'%s' is not a valid type for specifying bend list.\n",
+                       tmp);
+    }
+}
+
 
 static void ProcessCB_SB(pugi::xml_node Node, std::vector<bool>& list, const pugiutil::loc_data& loc_data) {
     const char* tmp = nullptr;
@@ -3092,6 +3165,9 @@ static void ProcessSwitches(pugi::xml_node Parent,
             type = SwitchType::SHORT;
             expect_only_attributes(Node, {"type", "name", "R", "Cin", "Cout", "Tdel"}, " with type "s + type_name + "'"s, loc_data);
 
+        } else if (0 == strcmp(type_name, "unishort")) {
+            type = SwitchType::UNISHORT;
+            expect_only_attributes(Node, {"type", "name", "R", "Cin", "Cout", "Tdel"}, " with type "s + type_name + "'"s, loc_data);
         } else {
             archfpga_throw(loc_data.filename_c_str(), loc_data.line(Node),
                            "Invalid switch type '%s'.\n", type_name);
@@ -3102,7 +3178,7 @@ static void ProcessSwitches(pugi::xml_node Parent,
 
         ReqOpt COUT_REQD = TIMING_ENABLE_REQD;
         ReqOpt CIN_REQD = TIMING_ENABLE_REQD;
-        if (arch_switch.type() == SwitchType::SHORT) {
+        if (arch_switch.type() == SwitchType::SHORT || arch_switch.type() == SwitchType::UNISHORT) {
             //Cin/Cout are optional on shorts, since they really only have one capacitance
             CIN_REQD = OPTIONAL;
             COUT_REQD = OPTIONAL;
@@ -3118,7 +3194,9 @@ static void ProcessSwitches(pugi::xml_node Parent,
         }
 
         if (arch_switch.type() == SwitchType::SHORT
-            || arch_switch.type() == SwitchType::PASS_GATE) {
+            || arch_switch.type() == SwitchType::PASS_GATE
+            || arch_switch.type() == SwitchType::UNISHORT) {
+
             //No buffers
             arch_switch.buf_size_type = BufferSize::ABSOLUTE;
             arch_switch.buf_size = 0.;

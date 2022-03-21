@@ -85,6 +85,7 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
                                           const bool use_full_seg_groups,
                                           const bool is_global_graph,
                                           const enum e_directionality directionality,
+                                          bool& use_bend_segment_groups,
                                           int* num_seg_details = nullptr);
 
 void alloc_and_load_chan_details(const DeviceGrid& grid,
@@ -164,7 +165,9 @@ int get_unidir_opin_connections(const int chan,
                                 const int max_len,
                                 const int max_chan_width,
                                 const t_rr_node_indices& L_rr_node_indices,
-                                bool* Fc_clipped);
+                                bool* Fc_clipped,
+                                const DeviceGrid& grid);
+
 
 int get_track_to_pins(int seg,
                       int chan,
@@ -199,7 +202,10 @@ int get_track_to_tracks(const int from_chan,
                         const enum e_directionality directionality,
                         const t_rr_node_indices& L_rr_node_indices,
                         const vtr::NdMatrix<std::vector<int>, 3>& switch_block_conn,
-                        t_sb_connection_map* sb_conn_map);
+                        t_sb_connection_map* sb_conn_map,
+                        const int bend_delayless_switch,
+                        std::map<int, int>& bend_segment_map);
+
 
 t_sblock_pattern alloc_sblock_pattern_lookup(const DeviceGrid& grid,
                                              const int max_chan_width);

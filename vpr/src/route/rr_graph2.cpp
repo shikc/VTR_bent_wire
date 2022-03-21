@@ -1,4 +1,7 @@
 #include <cstdio>
+#include <string.h>
+#include "limits.h"
+
 using namespace std;
 
 #include "vtr_util.h"
@@ -69,7 +72,10 @@ static int get_unidir_track_to_chan_seg(const int from_track,
                                         const t_chan_seg_details* seg_details,
                                         bool* Fs_clipped,
                                         const int from_rr_node,
-                                        t_rr_edge_info_set& rr_edges_to_create);
+                                        t_rr_edge_info_set& rr_edges_to_create,
+                                        const int bend_delayless_switch,
+                                        map<int, int>& bend_segment_map);
+
 
 static int get_track_to_chan_seg(const int from_track,
                                  const int to_chan,
@@ -88,6 +94,20 @@ static int vpr_to_phy_track(const int itrack,
                             const int seg_num,
                             const t_chan_seg_details* seg_details,
                             const enum e_directionality directionality);
+static bool is_corner(const DeviceGrid& grid, int x, int y);
+
+static bool is_perimeter_top(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_right(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_left(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_bottom(const DeviceGrid& grid, int x, int y);
+static bool is_style_perimeter(const DeviceGrid& grid, int x, int y, e_side to_side, e_switch_dir_type switch_type);
+
+static bool label_dangling_side(const e_side side, const int x, const int y, const DeviceGrid& grid);
+
+static int *label_wire_bends(const int chan_num, const int seg_num,
+                                const t_chan_seg_details* seg_details, const int seg_type_index, const int max_len,
+                                const enum e_direction dir, const int max_chan_width,
+                                int *num_bend_wires, bool is_dangling_side);
 
 static int* label_wire_muxes(const int chan_num,
                              const int seg_num,
@@ -98,7 +118,18 @@ static int* label_wire_muxes(const int chan_num,
                              const int max_chan_width,
                              const bool check_cb,
                              int* num_wire_muxes,
-                             int* num_wire_muxes_cb_restricted);
+                             int* num_wire_muxes_cb_restricted,
+                             bool is_dangling_side);
+static int* label_incoming_bend_wires_ending(const int chan_num,
+                                                const int seg_num,
+                                                const t_chan_seg_details* seg_details,
+                                                const int seg_type_index,
+                                                const int max_len,
+                                                const enum e_direction dir,
+                                                const int max_chan_width,
+                                                int* num_incoming_bend,
+                                                bool is_dangling_side);
+
 
 static int* label_incoming_wires(const int chan_num,
                                  const int seg_num,
@@ -114,7 +145,7 @@ static int find_label_of_track(int* wire_mux_on_track,
                                int num_wire_muxes,
                                int from_track);
 
-void dump_seg_details(t_seg_details* seg_details,
+void dump_seg_details(t_chan_seg_details* seg_details,
                       int max_chan_width,
                       const char* fname);
 
@@ -169,7 +200,7 @@ int* get_seg_track_counts(const int num_sets,
     for (size_t i = 0; i < segment_inf.size(); ++i) {
         result[i] = 0;
         demand[i] = scale * num_sets * segment_inf[i].frequency;
-        if (use_full_seg_groups) {
+        if (use_full_seg_groups || segment_inf[i].isbend) {
             demand[i] /= segment_inf[i].length;
         }
     }
@@ -178,6 +209,18 @@ int* get_seg_track_counts(const int num_sets,
     assigned = 0;
     size = 0;
     imax = 0;
+    // We should assigning tracks to the bend segment first cause they may have low radio
+    for (int i_seg = 0; i_seg < segment_inf.size(); ++i_seg) {
+        if (segment_inf[i_seg].isbend) {
+            while (demand[i_seg] > 0) {
+                size = segment_inf[i_seg].length;
+                demand[i_seg] -= reduce;
+                result[i_seg] += size;
+                assigned += size;
+            }
+        }
+    }
+
     while (assigned < num_sets) {
         /* Find current maximum demand */
         max = 0;
@@ -216,6 +259,7 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
                                           const bool use_full_seg_groups,
                                           const bool is_global_graph,
                                           const enum e_directionality directionality,
+                                          bool& use_bend_segment_groups,
                                           int* num_seg_details) {
     /* Allocates and loads the seg_details data structure.  Max_len gives the   *
      * maximum length of a segment (dimension of array).  The code below tries  *
@@ -232,6 +276,9 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
     int* sets_per_seg_type = nullptr;
     t_seg_details* seg_details = nullptr;
     bool longline;
+    int tmp_sum_len;
+    int index_offset;
+
 
     /* Unidir tracks are assigned in pairs, and bidir tracks individually */
     if (directionality == BI_DIRECTIONAL) {
@@ -253,6 +300,13 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
     tmp = 0;
     for (size_t i = 0; i < segment_inf.size(); ++i) {
         tmp += sets_per_seg_type[i] * fac;
+        if (segment_inf[i].isbend)
+            use_bend_segment_groups = true;
+    }
+    VTR_LOG("The segment distribution: \n");
+    for (size_t i = 0; i < segment_inf.size(); ++i) {
+        VTR_LOG("Segment name : %s Distribution: %d\n", segment_inf[i].name, sets_per_seg_type[i] * fac);
+
     }
     VTR_ASSERT(use_full_seg_groups || (tmp == *max_chan_width));
     *max_chan_width = tmp;
@@ -261,6 +315,9 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
 
     /* Setup the seg_details data */
     cur_track = 0;
+    index_offset = 0;
+    int cost_index_num = 0;
+
     for (size_t i = 0; i < segment_inf.size(); ++i) {
         first_track = cur_track;
 
@@ -279,82 +336,146 @@ t_seg_details* alloc_and_load_seg_details(int* max_chan_width,
         arch_wire_switch = segment_inf[i].arch_wire_switch;
         arch_opin_switch = segment_inf[i].arch_opin_switch;
         VTR_ASSERT((arch_wire_switch == arch_opin_switch) || (directionality != UNI_DIRECTIONAL));
+        /* if this segment is the bend segment, cut off the segment length */
+        std::vector<int> tmp_seg_len;
+        std::vector<e_switch_dir_type> tmp_switch_type;
+        if (segment_inf[i].isbend) {
+            int tmp_len = 1;
+            int sum_len = 0;
+
+            for (int i_len = 0; i_len < segment_inf[i].length - 1; i_len++) {
+                if (segment_inf[i].bend[i_len] == 0) {
+                    tmp_len++;
+                } else if (segment_inf[i].bend[i_len] != 0) {
+                    VTR_ASSERT(tmp_len < segment_inf[i].length);
+                    tmp_seg_len.push_back(tmp_len);
+                    if (segment_inf[i].bend[i_len] == 1)
+                        tmp_switch_type.push_back(UP_TYPE);
+                    else if (segment_inf[i].bend[i_len] == 2)
+                        tmp_switch_type.push_back(DOWN_TYPE);
+                    sum_len += tmp_len;
+                    tmp_len = 1;
+                }
+            }
+            // add the last clip of segment
+            if (sum_len < segment_inf[i].length) {
+                tmp_seg_len.push_back(segment_inf[i].length - sum_len);
+                tmp_switch_type.push_back(NORMAL_TYPE);
+            }
+        } else {
+            tmp_seg_len.push_back(segment_inf[i].length);
+            tmp_switch_type.push_back(NORMAL_TYPE);
+        }
+
 
         /* Set up the tracks of same type */
         group_start = 0;
-        for (itrack = 0; itrack < ntracks; itrack++) {
-            /* set the name of the segment type this track belongs to */
-            seg_details[cur_track].type_name = segment_inf[i].name;
+        tmp_sum_len = 0;
 
-            /* Remember the start track of the current wire group */
-            if ((itrack / fac) % length == 0 && (itrack % fac) == 0) {
-                group_start = cur_track;
-            }
+        int first_part_wire_switch = -1;
+        int first_part_opin_switch = -1;
 
-            seg_details[cur_track].length = length;
-            seg_details[cur_track].longline = longline;
+        for (size_t ipart = 0; ipart < tmp_seg_len.size(); ipart++) {
+            for (itrack = 0; itrack < (tmp_seg_len[ipart] * ntracks) / length; itrack++) {
+                /* set the name of the segment type this track belongs to */
+                seg_details[cur_track].type_name = segment_inf[i].name;
+                seg_details[cur_track].part_idx = ipart;
+                /* Remember the start track of the current wire group */
+                if ((itrack / fac) % tmp_seg_len[ipart] == 0 && (itrack % fac) == 0) {
+                    group_start = cur_track;
 
-            /* Stagger the start points in for each track set. The
-             * pin mappings should be aware of this when chosing an
-             * intelligent way of connecting pins and tracks.
-             * cur_track is used as an offset so that extra tracks
-             * from different segment types are hopefully better
-             * balanced. */
-            seg_details[cur_track].start = (cur_track / fac) % length + 1;
-
-            /* These properties are used for vpr_to_phy_track to determine
-             * * twisting of wires. */
-            seg_details[cur_track].group_start = group_start;
-            seg_details[cur_track].group_size = min(ntracks + first_track - group_start, length * fac);
-            VTR_ASSERT(0 == seg_details[cur_track].group_size % fac);
-            if (0 == seg_details[cur_track].group_size) {
-                seg_details[cur_track].group_size = length * fac;
-            }
-
-            seg_details[cur_track].seg_start = -1;
-            seg_details[cur_track].seg_end = -1;
-
-            /* Setup the cb and sb patterns. Global route graphs can't depopulate cb and sb
-             * since this is a property of a detailed route. */
-            seg_details[cur_track].cb = std::make_unique<bool[]>(length);
-            seg_details[cur_track].sb = std::make_unique<bool[]>(length + 1);
-            for (j = 0; j < length; ++j) {
-                if (is_global_graph || seg_details[cur_track].longline) {
-                    seg_details[cur_track].cb[j] = true;
-                } else {
-                    /* Use the segment's pattern. */
-                    index = j % segment_inf[i].cb.size();
-                    seg_details[cur_track].cb[j] = segment_inf[i].cb[index];
                 }
-            }
-            for (j = 0; j < (length + 1); ++j) {
-                if (is_global_graph || seg_details[cur_track].longline) {
-                    seg_details[cur_track].sb[j] = true;
-                } else {
-                    /* Use the segment's pattern. */
-                    index = j % segment_inf[i].sb.size();
-                    seg_details[cur_track].sb[j] = segment_inf[i].sb[index];
+                seg_details[cur_track].length = tmp_seg_len[ipart];
+                seg_details[cur_track].longline = longline;
+                seg_details[cur_track].switch_dir_type = tmp_switch_type[ipart];
+                seg_details[cur_track].bend_len = tmp_seg_len.size();
+
+                /* Stagger the start points in for each track set. The
+                * pin mappings should be aware of this when chosing an
+                * intelligent way of connecting pins and tracks.
+                * cur_track is used as an offset so that extra tracks
+                * from different segment types are hopefully better
+                * balanced. */
+                seg_details[cur_track].start = (cur_track / fac) % tmp_seg_len[ipart] + 1;
+
+                /* These properties are used for vpr_to_phy_track to determine
+                * * twisting of wires. */
+                seg_details[cur_track].group_start = group_start;
+                seg_details[cur_track].group_size =
+                        min(ntracks + first_track - group_start, tmp_seg_len[ipart] * fac);
+                VTR_ASSERT(0 == seg_details[cur_track].group_size % fac);
+                if (0 == seg_details[cur_track].group_size) {
+                    seg_details[cur_track].group_size = tmp_seg_len[ipart] * fac;
+
                 }
+                seg_details[cur_track].seg_start = -1;
+                seg_details[cur_track].seg_end = -1;
+
+                /* Setup the cb and sb patterns. Global route graphs can't depopulate cb and sb
+                * since this is a property of a detailed route. */
+                seg_details[cur_track].cb = std::make_unique<bool[]>(tmp_seg_len[ipart]);
+                seg_details[cur_track].sb = std::make_unique<bool[]>(tmp_seg_len[ipart] + 1);
+
+                for (j = 0; j < tmp_seg_len[ipart]; ++j) {
+                    if (is_global_graph || seg_details[cur_track].longline) {
+                        seg_details[cur_track].cb[j] = true;
+                    } else {
+                        /* Use the segment's pattern. */
+                        index = (j + tmp_sum_len) % segment_inf[i].cb.size();
+                        seg_details[cur_track].cb[j] = segment_inf[i].cb[index];
+                    }
+                }
+                for (j = 0; j < (tmp_seg_len[ipart] + 1); ++j) {
+                    if (is_global_graph || seg_details[cur_track].longline) {
+                        seg_details[cur_track].sb[j] = true;
+                    } else {
+                        /* Use the segment's pattern. */
+                        index = (j + tmp_sum_len) % segment_inf[i].sb.size();
+                        seg_details[cur_track].sb[j] = segment_inf[i].sb[index];
+                    }
+                }
+
+
+                seg_details[cur_track].Rmetal = segment_inf[i].Rmetal;
+                seg_details[cur_track].Cmetal = segment_inf[i].Cmetal;
+                //seg_details[cur_track].Cmetal_per_m = segment_inf[i].Cmetal_per_m;
+
+
+                if (0 == ipart) {
+                    seg_details[cur_track].arch_wire_switch = arch_wire_switch;
+                    seg_details[cur_track].arch_opin_switch = arch_opin_switch;
+                    seg_details[cur_track].first_opin_switch = arch_opin_switch;
+                    seg_details[cur_track].first_wire_switch = arch_wire_switch;
+                    first_part_opin_switch = arch_opin_switch;
+                    first_part_wire_switch = arch_wire_switch;
+                }else{
+                    seg_details[cur_track].arch_wire_switch = -1;
+                    seg_details[cur_track].arch_opin_switch = -1;
+                    seg_details[cur_track].first_wire_switch = first_part_wire_switch;
+                    seg_details[cur_track].first_opin_switch = first_part_opin_switch;
+                }
+
+
+                if (BI_DIRECTIONAL == directionality) {
+                    seg_details[cur_track].direction = BI_DIRECTION;
+                } else {
+                    VTR_ASSERT(UNI_DIRECTIONAL == directionality);
+                    seg_details[cur_track].direction = (itrack % 2) ? DEC_DIRECTION : INC_DIRECTION;
+                }
+
+
+                seg_details[cur_track].index = i;
+                seg_details[cur_track].cost_index = i + index_offset + ipart;
+
+
+                ++cur_track;
             }
-
-            seg_details[cur_track].Rmetal = segment_inf[i].Rmetal;
-            seg_details[cur_track].Cmetal = segment_inf[i].Cmetal;
-            //seg_details[cur_track].Cmetal_per_m = segment_inf[i].Cmetal_per_m;
-
-            seg_details[cur_track].arch_wire_switch = arch_wire_switch;
-            seg_details[cur_track].arch_opin_switch = arch_opin_switch;
-
-            if (BI_DIRECTIONAL == directionality) {
-                seg_details[cur_track].direction = BI_DIRECTION;
-            } else {
-                VTR_ASSERT(UNI_DIRECTIONAL == directionality);
-                seg_details[cur_track].direction = (itrack % 2) ? DEC_DIRECTION : INC_DIRECTION;
-            }
-
-            seg_details[cur_track].index = i;
-
-            ++cur_track;
+            tmp_sum_len += tmp_seg_len[ipart];
         }
+        if (tmp_seg_len.size() > 1)
+            index_offset += tmp_seg_len.size() - 1;
+
+        
     } /* End for each segment type. */
 
     /* free variables */
@@ -758,7 +879,9 @@ int get_unidir_opin_connections(const int chan,
                                 const int max_len,
                                 const int max_chan_width,
                                 const t_rr_node_indices& L_rr_node_indices,
-                                bool* Fc_clipped) {
+                                bool* Fc_clipped,
+                                const DeviceGrid& grid) {
+
     /* Gets a linked list of Fc nodes of specified seg_type_index to connect
      * to in given chan seg. Fc_ofs is used for the opin staggering pattern. */
 
@@ -782,10 +905,15 @@ int get_unidir_opin_connections(const int chan,
 
     /* Get the lists of possible muxes. */
     int dummy;
+    e_side inc_side = (CHANX == chan_type ? RIGHT : TOP);
+    e_side dec_side = (CHANX == chan_type ? LEFT : BOTTOM);
+    bool is_dangling_side_inc = label_dangling_side(inc_side, x, y, grid);
+    bool is_dangling_side_dec = label_dangling_side(dec_side, x, y, grid);
+
     inc_muxes = label_wire_muxes(chan, seg, seg_details, seg_type_index, max_len,
-                                 INC_DIRECTION, max_chan_width, true, &num_inc_muxes, &dummy);
+                                 INC_DIRECTION, max_chan_width, true, &num_inc_muxes, &dummy, is_dangling_side_inc);
     dec_muxes = label_wire_muxes(chan, seg, seg_details, seg_type_index, max_len,
-                                 DEC_DIRECTION, max_chan_width, true, &num_dec_muxes, &dummy);
+                                 DEC_DIRECTION, max_chan_width, true, &num_dec_muxes, &dummy, is_dangling_side_dec);
 
     /* Clip Fc to the number of muxes. */
     if (((Fc / 2) > num_inc_muxes) || ((Fc / 2) > num_dec_muxes)) {
@@ -817,10 +945,18 @@ int get_unidir_opin_connections(const int chan,
         }
 
         /* Add to the list. */
-        rr_edges_to_create.emplace_back(from_rr_node, inc_inode_index, seg_details[inc_track].arch_opin_switch());
+        if (seg_details[inc_track].part_idx() > 0 && is_dangling_side_inc)
+            rr_edges_to_create.emplace_back(from_rr_node, inc_inode_index, seg_details[inc_track].first_opin_switch());
+        else
+            rr_edges_to_create.emplace_back(from_rr_node, inc_inode_index, seg_details[inc_track].arch_opin_switch());
+
         ++num_edges;
 
-        rr_edges_to_create.emplace_back(from_rr_node, dec_inode_index, seg_details[dec_track].arch_opin_switch());
+        if (seg_details[dec_track].part_idx() > 0 && is_dangling_side_dec)
+            rr_edges_to_create.emplace_back(from_rr_node, dec_inode_index, seg_details[dec_track].first_opin_switch());
+        else
+            rr_edges_to_create.emplace_back(from_rr_node, dec_inode_index, seg_details[dec_track].arch_opin_switch());
+
         ++num_edges;
     }
 
@@ -881,6 +1017,7 @@ void dump_seg_details(const t_chan_seg_details* seg_details,
 
         fprintf(fp, "direction: %s\n",
                 DIRECTION_STRING[seg_details[i].direction()]);
+        fprintf(fp, "name: %s\n", seg_details[i].type_name().c_str());
 
         fprintf(fp, "cb list:  ");
         for (int j = 0; j < seg_details[i].length(); j++)
@@ -891,9 +1028,90 @@ void dump_seg_details(const t_chan_seg_details* seg_details,
         for (int j = 0; j <= seg_details[i].length(); j++)
             fprintf(fp, "%d ", seg_details[i].sb(j));
         fprintf(fp, "\n");
+        fprintf(fp, "bend part index: %d (max: %d)\n", seg_details[i].part_idx(), seg_details[i].bend_len());
+        fprintf(fp, "seg index: %d\n", seg_details[i].index());
+        fprintf(fp, "cost index: %d\n", seg_details[i].cost_index());
+
+        if (seg_details[i].switch_dir_type() == UP_TYPE)
+            fprintf(fp, "bend switch type : UP ");
+        else if (seg_details[i].switch_dir_type() == DOWN_TYPE)
+            fprintf(fp, "bend switch type : DOWN ");
+        else if (seg_details[i].switch_dir_type() == NORMAL_TYPE)
+            fprintf(fp, "bend switch type : NORMAL_TYPE ");
+
+        fprintf(fp, "first_wire_switch: %d first_opin_switch: %d\n", seg_details[i].first_wire_switch(), seg_details[i].first_opin_switch());
+
 
         fprintf(fp, "\n");
     }
+}
+void dump_custom_sblock_pattern(
+    t_sb_connection_map* sb_conn_map,
+    int max_chan_width,
+    const DeviceGrid& grid,
+    const char* fname) {
+    FILE* fp = vtr::fopen(fname, "w");
+    if (fp) {
+        for (size_t y = 0; y <= grid.height() - 2; ++y) {
+            for (size_t x = 0; x <= grid.width() - 2; ++x) {
+                fprintf(fp, "==========================\n");
+                fprintf(fp, "sblock_pattern: [%zu][%zu]\n", x, y);
+                fprintf(fp, "==========================\n");
+
+                for (e_side from_side : SIDES) {
+                    for (e_side to_side : SIDES) {
+                        if (from_side == to_side)
+                            continue;
+
+                        const char* psz_from_side = "?";
+                        switch (from_side) {
+                            case TOP:
+                                psz_from_side = "T";
+                                break;
+                            case RIGHT:
+                                psz_from_side = "R";
+                                break;
+                            case BOTTOM:
+                                psz_from_side = "B";
+                                break;
+                            case LEFT:
+                                psz_from_side = "L";
+                                break;
+                            default:
+                                VTR_ASSERT_MSG(false, "Unrecognized from side");
+                                break;
+                        }
+                        const char* psz_to_side = "?";
+                        switch (to_side) {
+                            case TOP:
+                                psz_to_side = "T";
+                                break;
+                            case RIGHT:
+                                psz_to_side = "R";
+                                break;
+                            case BOTTOM:
+                                psz_to_side = "B";
+                                break;
+                            case LEFT:
+                                psz_to_side = "L";
+                                break;
+                            default:
+                                VTR_ASSERT_MSG(false, "Unrecognized to side");
+                                break;
+                        }
+
+                        Switchblock_Lookup sb_conn(x, y, from_side, to_side);
+                        for (auto edge : (*sb_conn_map)[sb_conn]) {
+                            fprintf(fp, "%s %hd => %s %hd  [switch: %hd]\n",
+                                    psz_from_side, edge.from_wire, psz_to_side,
+                                    edge.to_wire, edge.switch_ind);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fclose(fp);
 }
 
 /* Dumps out an array of seg_details structures to file fname.  Used only   *
@@ -1501,7 +1719,10 @@ int get_track_to_tracks(const int from_chan,
                         const enum e_directionality directionality,
                         const t_rr_node_indices& L_rr_node_indices,
                         const vtr::NdMatrix<std::vector<int>, 3>& switch_block_conn,
-                        t_sb_connection_map* sb_conn_map) {
+                        t_sb_connection_map* sb_conn_map,
+                        const int bend_delayless_switch,
+                        std::map<int, int>& bend_segment_map) {
+
     int to_chan, to_sb;
     std::vector<int> conn_tracks;
     bool from_is_sblock, is_behind, Fs_clipped;
@@ -1657,7 +1878,10 @@ int get_track_to_tracks(const int from_chan,
                                                                  sblock_pattern,
                                                                  switch_override,
                                                                  L_rr_node_indices, to_seg_details,
-                                                                 &Fs_clipped, from_rr_node, rr_edges_to_create);
+                                                                 &Fs_clipped, from_rr_node, rr_edges_to_create,
+                                                                 bend_delayless_switch,
+                                                                 bend_segment_map);
+
                     }
                 }
             }
@@ -1697,7 +1921,10 @@ int get_track_to_tracks(const int from_chan,
                                                                  sblock_pattern,
                                                                  switch_override,
                                                                  L_rr_node_indices, to_seg_details,
-                                                                 &Fs_clipped, from_rr_node, rr_edges_to_create);
+                                                                 &Fs_clipped, from_rr_node, rr_edges_to_create,
+                                                                 bend_delayless_switch,
+                                                                 bend_segment_map);
+
                     }
                 }
             }
@@ -1865,7 +2092,10 @@ static int get_unidir_track_to_chan_seg(const int from_track,
                                         const t_chan_seg_details* seg_details,
                                         bool* Fs_clipped,
                                         const int from_rr_node,
-                                        t_rr_edge_info_set& rr_edges_to_create) {
+                                        t_rr_edge_info_set& rr_edges_to_create,
+                                        const int bend_delayless_switch,
+                                        map<int, int>& bend_segment_map) {
+
     int num_labels = 0;
     int* mux_labels = nullptr;
 
@@ -1885,8 +2115,9 @@ static int get_unidir_track_to_chan_seg(const int from_track,
 
     /* get list of muxes to which we can connect */
     int dummy;
+    bool is_dangling_side = label_dangling_side(to_side, sb_x, sb_y, grid);
     mux_labels = label_wire_muxes(to_chan, to_seg, seg_details, UNDEFINED, max_len,
-                                  to_dir, max_chan_width, false, &num_labels, &dummy);
+                                  to_dir, max_chan_width, false, &num_labels, &dummy, is_dangling_side);
 
     /* Can't connect if no muxes. */
     if (num_labels < 1) {
@@ -1909,10 +2140,23 @@ static int get_unidir_track_to_chan_seg(const int from_track,
         for (int j = 0; j < 4; j = j + 2) {
             /* Use the balanced labeling for passing and fringe wires */
             int to_mux = sblock_pattern[sb_x][sb_y][from_side][to_side][from_track][j];
-            if (to_mux == UN_SET)
-                continue;
-
             int to_track = sblock_pattern[sb_x][sb_y][from_side][to_side][from_track][j + 1];
+            if (to_mux == UN_SET && to_track == UN_SET)
+                continue;
+            if (to_mux == UN_SET && to_track != UN_SET) {
+                /* Add edge to list. */
+
+                int to_node = get_rr_node_index(L_rr_node_indices, to_x, to_y, to_type, to_track);
+
+                VTR_ASSERT(bend_segment_map.count(to_node) == 0);
+                bend_segment_map[to_node] = from_rr_node;
+                rr_edges_to_create.emplace_back(from_rr_node, to_node, bend_delayless_switch);
+                ++count;
+                continue;
+            }
+
+
+
             if (to_track == UN_SET) {
                 to_track = mux_labels[(to_mux + i) % num_labels];
                 sblock_pattern[sb_x][sb_y][from_side][to_side][from_track][j + 1] = to_track;
@@ -1923,9 +2167,15 @@ static int get_unidir_track_to_chan_seg(const int from_track,
             if (to_node == OPEN) {
                 continue;
             }
+            if (seg_details[to_track].part_idx() > 0)
+                VTR_ASSERT(is_dangling_side);
+
 
             //Determine which switch to use
             int iswitch = seg_details[to_track].arch_wire_switch();
+            if (iswitch == OPEN && seg_details[to_track].part_idx() > 0)
+                iswitch = seg_details[to_track].first_wire_switch();
+
 
             //Apply any switch overrides
             if (should_apply_switch_override(switch_override)) {
@@ -2122,6 +2372,40 @@ t_sblock_pattern alloc_sblock_pattern_lookup(const DeviceGrid& grid,
     /* This is the outer pointer to the full matrix */
     return sblock_pattern;
 }
+static short find_to_side_bend_point(int itrack, const t_chan_seg_details* from_seg_details, const t_chan_seg_details* to_seg_details, const int* incoming_end_label, const int num_incoming_bend_end, const int* wire_bend_label, const int num_bend_wires) {
+    std::vector<int> from_points;
+    std::vector<int> to_points;
+    int i;
+    short to_track;
+
+    VTR_ASSERT(num_bend_wires == num_incoming_bend_end);
+    for (i = 0; i < num_bend_wires; i++) {
+        int wire_idx = wire_bend_label[i];
+        if (to_seg_details[wire_idx].type_name() == from_seg_details[itrack].type_name()) {
+            if (to_seg_details[wire_idx].part_idx() == from_seg_details[itrack].part_idx() + 1)
+                to_points.push_back(wire_idx);
+        }
+    }
+
+    for (i = 0; i < num_incoming_bend_end; i++) {
+        int wire_idx = incoming_end_label[i];
+        if (from_seg_details[wire_idx].type_name() == from_seg_details[itrack].type_name()) {
+            if (from_seg_details[wire_idx].part_idx() == from_seg_details[itrack].part_idx())
+                from_points.push_back(wire_idx);
+        }
+    }
+
+    VTR_ASSERT(!from_points.empty());
+    VTR_ASSERT(!to_points.empty());
+    VTR_ASSERT(from_points.size() == to_points.size());
+
+    auto itr = find(from_points.begin(), from_points.end(), itrack);
+    VTR_ASSERT(itr != from_points.end());
+    auto idx_from = std::distance(std::begin(from_points), itr);
+    to_track = (short)to_points[idx_from];
+
+    return to_track;
+}
 
 void load_sblock_pattern_lookup(const int i,
                                 const int j,
@@ -2181,6 +2465,18 @@ void load_sblock_pattern_lookup(const int i,
     int num_incoming_wires[4];
     int num_ending_wires[4];
     int num_wire_muxes[4];
+    int* wire_bend_label[4];
+    int num_bend_wires[4];
+    int* incoming_bend_end_label[4];
+    int num_incoming_bend[4];
+
+    bool is_dangling_side[4];
+
+    /* "Label" if the side of switch block is the dangling side according to the location of switch block */
+    for (e_side side : {TOP, RIGHT, BOTTOM, LEFT}) {
+        is_dangling_side[side] = label_dangling_side(side, i, j, grid);
+    }
+
 
     /* "Label" the wires around the switch block by connectivity. */
     for (e_side side : {TOP, RIGHT, BOTTOM, LEFT}) {
@@ -2190,6 +2486,11 @@ void load_sblock_pattern_lookup(const int i,
         num_incoming_wires[side] = 0;
         num_ending_wires[side] = 0;
         num_wire_muxes[side] = 0;
+        wire_bend_label[side] = nullptr;
+        num_bend_wires[side] = 0;
+        incoming_bend_end_label[side] = nullptr;
+        num_incoming_bend[side] = 0;
+
 
         /* Skip the side and leave the zero'd value if the
          * channel segment doesn't exist. */
@@ -2241,13 +2542,20 @@ void load_sblock_pattern_lookup(const int i,
         incoming_wire_label[side] = label_incoming_wires(chan, seg, sb_seg,
                                                          seg_details, chan_len, end_dir, nodes_per_chan->max,
                                                          &num_incoming_wires[side], &num_ending_wires[side]);
+        incoming_bend_end_label[side] = label_incoming_bend_wires_ending(chan, seg,
+                                                                         seg_details, UNDEFINED, chan_len, end_dir, nodes_per_chan->max,
+                                                                         &num_incoming_bend[side], is_dangling_side[side]);
 
         /* Figure out all the tracks on a side that are starting. */
         int dummy;
         enum e_direction start_dir = (pos_dir ? INC_DIRECTION : DEC_DIRECTION);
         wire_mux_on_track[side] = label_wire_muxes(chan, seg,
                                                    seg_details, UNDEFINED, chan_len, start_dir, nodes_per_chan->max,
-                                                   false, &num_wire_muxes[side], &dummy);
+                                                   false, &num_wire_muxes[side], &dummy, is_dangling_side[side]);
+        wire_bend_label[side] = label_wire_bends(chan, seg,
+                                                 seg_details, UNDEFINED, chan_len, start_dir, nodes_per_chan->max,
+                                                 &num_bend_wires[side], is_dangling_side[side]);
+
     }
 
     for (e_side to_side : {TOP, RIGHT, BOTTOM, LEFT}) {
@@ -2260,6 +2568,18 @@ void load_sblock_pattern_lookup(const int i,
         int side_cw = (to_side + 1) % 4;
         int side_opp = (to_side + 2) % 4;
         int side_ccw = (to_side + 3) % 4;
+        /* Figure out the channel and segment for a certain direction */
+        bool vert = ((to_side == TOP) || (to_side == BOTTOM));
+        bool pos_dir = ((to_side == TOP) || (to_side == RIGHT));
+        int chan = (vert ? i : j);
+        int sb_seg = (vert ? j : i);
+        int seg = (pos_dir ? (sb_seg + 1) : sb_seg);
+        int chan_len = (vert ? grid.height() : grid.width()) - 2; //-2 for no perim channels
+
+        const t_chan_seg_details* to_seg_details = (vert ? chan_details_y[chan][seg].data() : chan_details_x[seg][chan].data());
+        if (to_seg_details[0].length() <= 0)
+            continue;
+
 
         /* For the core sblock:
          * The new order for passing wires should appear as
@@ -2273,6 +2593,18 @@ void load_sblock_pattern_lookup(const int i,
          * if you replace "passing" by "incoming" */
 
         if (incoming_wire_label[side_cw]) {
+            /* Figure out the channel and segment for a certain direction */
+            vert = ((side_cw == TOP) || (side_cw == BOTTOM));
+            pos_dir = ((side_cw == TOP) || (side_cw == RIGHT));
+            chan_len = (vert ? grid.height() : grid.width()) - 2; //-2 for no perim channels
+            chan = (vert ? i : j);
+            sb_seg = (vert ? j : i);
+            seg = (pos_dir ? (sb_seg + 1) : sb_seg);
+
+            const t_chan_seg_details* seg_details = (vert ? chan_details_y[chan][seg].data() : chan_details_x[seg][chan].data());
+            if (seg_details[0].length() <= 0)
+                continue;
+
             for (int ichan = 0; ichan < nodes_per_chan->max; ichan++) {
                 int itrack = ichan;
                 if (side_cw == TOP || side_cw == BOTTOM) {
@@ -2280,6 +2612,40 @@ void load_sblock_pattern_lookup(const int i,
                 } else if (side_cw == RIGHT || side_cw == LEFT) {
                     itrack = ichan % nodes_per_chan->x_list[j];
                 }
+                /* DOWN stype from side_cw , if incoming wire is the ending of bend segment,
+                 * and the bend style is the DOWN_STYLE
+                 * then finding the track map bewtween side_cw and to_side
+                 */
+
+                // bend ending point
+                e_direction check_dir = (pos_dir ? DEC_DIRECTION : INC_DIRECTION);
+                if (incoming_wire_label[side_cw][itrack] < num_ending_wires[side_cw] && seg_details[itrack].direction() == check_dir) {
+                    // not the dangling incoming segment
+                    int true_seg_start = seg - (seg + seg_details[itrack].length() + chan - seg_details[itrack].start()) % seg_details[itrack].length();
+                    int true_seg_end = true_seg_start + seg_details[itrack].length() - 1;
+                    int start = get_seg_start(seg_details, itrack, chan, seg);
+                    int end = get_seg_end(seg_details, itrack, start, chan, chan_len);
+                    bool clipped = (check_dir == DEC_DIRECTION ? true_seg_start != start : true_seg_end != end);
+                    if ((!is_dangling_side[side_cw]) || !clipped)
+                        // middle part of the bend segment
+                        if (seg_details[itrack].part_idx() != seg_details[itrack].bend_len() - 1) {
+                            // if bend style is the DOWN_TYPE
+                            if (seg_details[itrack].switch_dir_type() == DOWN_TYPE) {
+                                // assign to_track
+                                sblock_pattern[i][j][side_cw][to_side][itrack][1] = find_to_side_bend_point(itrack, seg_details, to_seg_details,
+                                                                                                            incoming_bend_end_label[side_cw], num_incoming_bend[side_cw],
+                                                                                                            wire_bend_label[to_side], num_bend_wires[to_side]);
+                                continue;
+                            }
+                            if (seg_details[itrack].switch_dir_type() == UP_TYPE && is_corner(grid, i, j)) {
+                                sblock_pattern[i][j][side_cw][to_side][itrack][1] = find_to_side_bend_point(itrack, seg_details, to_seg_details,
+                                                                                                            incoming_bend_end_label[side_cw], num_incoming_bend[side_cw],
+                                                                                                            wire_bend_label[to_side], num_bend_wires[to_side]);
+                                continue;
+                            }
+                        }
+                }
+
 
                 if (incoming_wire_label[side_cw][itrack] != UN_SET) {
                     int mux = get_simple_switch_block_track((enum e_side)side_cw,
@@ -2298,6 +2664,17 @@ void load_sblock_pattern_lookup(const int i,
         }
 
         if (incoming_wire_label[side_ccw]) {
+            /* Figure out the channel and segment for a certain direction */
+            vert = ((side_ccw == TOP) || (side_ccw == BOTTOM));
+            pos_dir = ((side_ccw == TOP) || (side_ccw == RIGHT));
+            chan = (vert ? i : j);
+            sb_seg = (vert ? j : i);
+            seg = (pos_dir ? (sb_seg + 1) : sb_seg);
+
+            const t_chan_seg_details* seg_details = (vert ? chan_details_y[chan][seg].data() : chan_details_x[seg][chan].data());
+            if (seg_details[0].length() <= 0)
+                continue;
+
             for (int ichan = 0; ichan < nodes_per_chan->max; ichan++) {
                 int itrack = ichan;
                 if (side_ccw == TOP || side_ccw == BOTTOM) {
@@ -2305,6 +2682,41 @@ void load_sblock_pattern_lookup(const int i,
                 } else if (side_ccw == RIGHT || side_ccw == LEFT) {
                     itrack = ichan % nodes_per_chan->x_list[j];
                 }
+                /* UP stype from side_ccw , if incoming wire is the ending of bend segment,
+                 * and the bend style is the UP_STYPE
+                 * then finding the track map bewtween side_ccw and to_side
+                 */
+
+                // bend ending point
+                e_direction check_dir = (pos_dir ? DEC_DIRECTION : INC_DIRECTION);
+                if (incoming_wire_label[side_ccw][itrack] < num_ending_wires[side_ccw]
+                    && seg_details[itrack].direction() == check_dir) {
+                    // not the dangling incoming segment
+                    int true_seg_start = seg - (seg + seg_details[itrack].length() + chan - seg_details[itrack].start()) % seg_details[itrack].length();
+                    int true_seg_end = true_seg_start + seg_details[itrack].length() - 1;
+                    int start = get_seg_start(seg_details, itrack, chan, seg);
+                    int end = get_seg_end(seg_details, itrack, start, chan, chan_len);
+                    bool clipped = (check_dir == DEC_DIRECTION ? true_seg_start != start : true_seg_end != end);
+                    if (!clipped || (!is_dangling_side[side_ccw]))
+                        // middle part of the bend segment
+                        if (seg_details[itrack].part_idx() != seg_details[itrack].bend_len() - 1) {
+                            // if bend style is the UP_TYPE
+                            if (seg_details[itrack].switch_dir_type() == UP_TYPE) {
+                                // assign to_track
+                                sblock_pattern[i][j][side_ccw][to_side][itrack][1] = find_to_side_bend_point(itrack, seg_details, to_seg_details,
+                                                                                                             incoming_bend_end_label[side_ccw], num_incoming_bend[side_ccw],
+                                                                                                             wire_bend_label[to_side], num_bend_wires[to_side]);
+                                continue;
+                            }
+                            if (seg_details[itrack].switch_dir_type() == DOWN_TYPE && is_corner(grid, i, j)) {
+                                sblock_pattern[i][j][side_ccw][to_side][itrack][1] = find_to_side_bend_point(itrack, seg_details, to_seg_details,
+                                                                                                             incoming_bend_end_label[side_ccw], num_incoming_bend[side_ccw],
+                                                                                                             wire_bend_label[to_side], num_bend_wires[to_side]);
+                                continue;
+                            }
+                        }
+                }
+
 
                 if (incoming_wire_label[side_ccw][itrack] != UN_SET) {
                     int mux = get_simple_switch_block_track((enum e_side)side_ccw,
@@ -2322,18 +2734,54 @@ void load_sblock_pattern_lookup(const int i,
         }
 
         if (incoming_wire_label[side_opp]) {
+            /* Figure out the channel and segment for a certain direction */
+            vert = ((side_opp == TOP) || (side_opp == BOTTOM));
+            pos_dir = ((side_opp == TOP) || (side_opp == RIGHT));
+            chan = (vert ? i : j);
+            sb_seg = (vert ? j : i);
+            seg = (pos_dir ? (sb_seg + 1) : sb_seg);
+
+            const t_chan_seg_details* seg_details = (vert ? chan_details_y[chan][seg].data() : chan_details_x[seg][chan].data());
+            if (seg_details[0].length() <= 0)
+                continue;
+
             for (int itrack = 0; itrack < nodes_per_chan->max; itrack++) {
                 /* not ending wire nor passing wire with sblock */
                 if (incoming_wire_label[side_opp][itrack] != UN_SET) {
                     /* corner sblocks for sure have no opposite channel segments so don't care about them */
                     if (incoming_wire_label[side_opp][itrack] < num_ending_wires[side_opp]) {
-                        /* The ending wires in core sblocks form N-to-N assignment problem, so can
-                         * use any pattern such as Wilton */
-                        /* In the direct connect case, I know for sure the init mux is at the same track #
-                         * as this ending wire, but still need to find the init mux label for Fs > 3 */
-                        int mux = find_label_of_track(wire_mux_on_track[to_side],
-                                                      num_wire_muxes[to_side], itrack);
-                        sblock_pattern[i][j][side_opp][to_side][itrack][0] = mux;
+                        /* If it is bend segment, use wilton way */
+                        if (seg_details[itrack].bend_len() > 1) {
+                            // fringe pattern
+                            if (is_style_perimeter(grid, i, j, to_side, seg_details[itrack].switch_dir_type())
+                                && !is_corner(grid, i, j)) {
+                                // middle part of the bend segment
+                                if (seg_details[itrack].part_idx() != seg_details[itrack].bend_len() - 1) {
+                                    sblock_pattern[i][j][side_opp][to_side][itrack][1] = find_to_side_bend_point(itrack, seg_details, to_seg_details,
+                                                                                                                 incoming_bend_end_label[side_opp], num_incoming_bend[side_opp],
+                                                                                                                 wire_bend_label[to_side], num_bend_wires[to_side]);
+                                    continue;
+                                }
+                            }
+
+                            //TODO: change this pattern, investigate different patterns
+                            int mux = get_wilton_like_straight_sblock((enum e_side)to_side,
+                                                                      incoming_wire_label[side_opp][itrack],
+                                                                      seg_details[itrack].switch_dir_type(),
+                                                                      num_wire_muxes[to_side]);
+
+                            VTR_ASSERT(sblock_pattern[i][j][side_opp][to_side][itrack][0] == UN_SET);
+                            sblock_pattern[i][j][side_opp][to_side][itrack][0] = mux;
+                        } else {
+                            /* The ending wires in core sblocks form N-to-N assignment problem, so can
+                             * use any pattern such as Wilton */
+                            /* In the direct connect case, I know for sure the init mux is at the same track #
+                             * as this ending wire, but still need to find the init mux label for Fs > 3 */
+                            int mux = find_label_of_track(wire_mux_on_track[to_side],
+                                                          num_wire_muxes[to_side], itrack);
+                            sblock_pattern[i][j][side_opp][to_side][itrack][0] = mux;
+                        }
+
                     } else {
                         /* These are wire segments that pass through the switch block.
                          *
@@ -2356,7 +2804,215 @@ void load_sblock_pattern_lookup(const int i,
         if (wire_mux_on_track[side]) {
             vtr::free(wire_mux_on_track[side]);
         }
+        if (wire_bend_label[side]) {
+            vtr::free(wire_bend_label[side]);
+        }
+        if (incoming_bend_end_label[side]) {
+            vtr::free(incoming_bend_end_label[side]);
+        }
     }
+}
+
+/* checks if the specified coordinates represent a corner of the FPGA */
+static bool is_corner(const DeviceGrid& grid, int x, int y) {
+    bool is_corner = false;
+    if ((x == 0 && y == 0) || (x == 0 && y == int(grid.height()) - 2) || //-2 for no perim channels
+        (x == int(grid.width()) - 2 && y == 0) ||                        //-2 for no perim channels
+        (x == int(grid.width()) - 2 && y == int(grid.height()) - 2)) {   //-2 for no perim channels
+        is_corner = true;
+    }
+    return is_corner;
+}
+
+static bool is_perimeter_left(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_left = false;
+    if (x == 0) {
+        is_perimeter_left = true;
+    }
+    return is_perimeter_left;
+}
+
+static bool is_perimeter_right(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_right = false;
+    if (x == int(grid.width()) - 2) {
+        is_perimeter_right = true;
+    }
+    return is_perimeter_right;
+}
+
+static bool is_perimeter_top(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_top = false;
+    if (y == int(grid.height()) - 2) {
+        is_perimeter_top = true;
+    }
+    return is_perimeter_top;
+}
+
+static bool is_perimeter_bottom(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_bottom = false;
+    if (y == 0) {
+        is_perimeter_bottom = true;
+    }
+    return is_perimeter_bottom;
+}
+
+static bool is_style_perimeter(const DeviceGrid& grid, int x, int y, e_side to_side, e_switch_dir_type switch_type) {
+    bool is_style_perimeter = false;
+    if (switch_type == DOWN_TYPE) {
+        if (is_perimeter_right(grid, x, y) && to_side == TOP)
+            is_style_perimeter = true;
+        else if (is_perimeter_left(grid, x, y) && to_side == BOTTOM)
+            is_style_perimeter = true;
+        else if (is_perimeter_top(grid, x, y) && to_side == LEFT)
+            is_style_perimeter = true;
+        else if (is_perimeter_bottom(grid, x, y) && to_side == RIGHT)
+            is_style_perimeter = true;
+    } else if (switch_type == UP_TYPE) {
+        if (is_perimeter_right(grid, x, y) && to_side == BOTTOM)
+            is_style_perimeter = true;
+        else if (is_perimeter_left(grid, x, y) && to_side == TOP)
+            is_style_perimeter = true;
+        else if (is_perimeter_top(grid, x, y) && to_side == RIGHT)
+            is_style_perimeter = true;
+        else if (is_perimeter_bottom(grid, x, y) && to_side == LEFT)
+            is_style_perimeter = true;
+    }
+    return is_style_perimeter;
+}
+
+static bool label_dangling_side(const e_side side, const int x, const int y, const DeviceGrid& grid) {
+    bool is_dangling = false;
+    // left-bottom corner
+    if (x == 0 && y == 0) {
+        if (side == TOP || side == RIGHT)
+            is_dangling = true;
+    }
+    // left-top corner
+    else if (x == 0 && y == int(grid.height()) - 2) {
+        if (side == BOTTOM || side == RIGHT)
+            is_dangling = true;
+    }
+    // right-bottom corner
+    else if (x == int(grid.width()) - 2 && y == 0) {
+        if (side == TOP || side == LEFT)
+            is_dangling = true;
+    }
+    // right-top corner
+    else if (x == int(grid.width()) - 2 && y == int(grid.height()) - 2) {
+        if (side == BOTTOM || side == LEFT)
+            is_dangling = true;
+    }
+    // top fringe
+    else if (y == int(grid.height()) - 2) {
+        if (side == BOTTOM)
+            is_dangling = true;
+    }
+    // bottom fringe
+    else if (y == 0) {
+        if (side == TOP)
+            is_dangling = true;
+    }
+    // right fringe
+    else if (x == int(grid.width()) - 2) {
+        if (side == LEFT)
+            is_dangling = true;
+    }
+    // left fringe
+    else if (x == 0) {
+        if (side == RIGHT)
+            is_dangling = true;
+    }
+
+    return is_dangling;
+}
+
+static int* label_wire_bends(const int chan_num,
+                             const int seg_num,
+                             const t_chan_seg_details* seg_details,
+                             const int seg_type_index,
+                             const int max_len,
+                             const enum e_direction dir,
+                             const int max_chan_width,
+                             int* num_bend_wires,
+                             bool is_dangling_side) {
+    /* Labels the bend segment start points on that side (seg_num, chan_num, direction). The returned array
+     * maps a label to the actual track #: array[0] = <the track number of the first/lowest mux>
+     * This routine orders wire bends by their natural order, i.e. track #
+     * If seg_type_index == UNDEFINED, all segments in the channel are considered. Otherwise this routine
+     * only looks at segments that belong to the specified segment type. */
+
+    int itrack, start, end, pass;
+    int* labels = nullptr;
+    bool is_endpoint, isdangling;
+    int num_labels;
+    int true_seg_start, true_seg_end, length;
+    bool clipped;
+
+    /* COUNT pass then a LOAD pass */
+    num_labels = 0;
+    for (pass = 0; pass < 2; ++pass) {
+        /* Alloc the list on LOAD pass */
+        if (pass > 0) {
+            labels = (int*)vtr::malloc(sizeof(int) * num_labels);
+            num_labels = 0;
+        }
+
+        /* Find the tracks that are starting. */
+        for (itrack = 0; itrack < max_chan_width; ++itrack) {
+            start = get_seg_start(seg_details, itrack, chan_num, seg_num);
+            end = get_seg_end(seg_details, itrack, start, chan_num, max_len);
+
+            /* Skip tracks that are undefined */
+            if (seg_details[itrack].length() == 0) {
+                continue;
+            }
+
+            /* Skip tracks going the wrong way */
+            if (seg_details[itrack].direction() != dir) {
+                continue;
+            }
+
+            if (seg_type_index != UNDEFINED) {
+                /* skip tracks that don't belong to the specified segment type */
+                if (seg_details[itrack].index() != seg_type_index) {
+                    continue;
+                }
+            }
+
+            length = seg_details[itrack].length();
+            true_seg_start = seg_num - (seg_num + length + chan_num - seg_details[itrack].start()) % length;
+            true_seg_end = true_seg_start + seg_details[itrack].length() - 1;
+            clipped = (dir == INC_DIRECTION ? true_seg_start != start : true_seg_end != end);
+
+            /* Determine if we are a wire startpoint */
+            is_endpoint = (seg_num == start);
+            if (DEC_DIRECTION == seg_details[itrack].direction()) {
+                is_endpoint = (seg_num == end);
+            }
+
+            isdangling = false;
+            if (is_endpoint && is_dangling_side) {
+                if (clipped) {
+                    isdangling = true;
+                }
+            }
+
+            /* Skip tracks that in the middle of bend segment */
+            if (seg_details[itrack].part_idx() > 0 && is_endpoint && !isdangling) {
+                if (pass > 0) {
+                    labels[num_labels] = itrack;
+                }
+                num_labels++;
+                continue;
+            }
+        }
+    }
+
+    *num_bend_wires = num_labels;
+
+    return labels;
+
+    
 }
 
 static int* label_wire_muxes(const int chan_num,
@@ -2368,7 +3024,9 @@ static int* label_wire_muxes(const int chan_num,
                              const int max_chan_width,
                              const bool check_cb,
                              int* num_wire_muxes,
-                             int* num_wire_muxes_cb_restricted) {
+                             int* num_wire_muxes_cb_restricted,
+                             bool is_dangling_side) {
+
     /* Labels the muxes on that side (seg_num, chan_num, direction). The returned array
      * maps a label to the actual track #: array[0] = <the track number of the first/lowest mux>
      * This routine orders wire muxes by their natural order, i.e. track #
@@ -2377,7 +3035,10 @@ static int* label_wire_muxes(const int chan_num,
 
     int itrack, start, end, num_labels, num_labels_restricted, pass;
     int* labels = nullptr;
-    bool is_endpoint;
+    bool is_endpoint, isdangling;
+    int true_seg_start, true_seg_end, length;
+    bool clipped;
+
 
     /* COUNT pass then a LOAD pass */
     num_labels = 0;
@@ -2410,12 +3071,27 @@ static int* label_wire_muxes(const int chan_num,
                     continue;
                 }
             }
+            length = seg_details[itrack].length();
+            true_seg_start = seg_num - (seg_num + length + chan_num - seg_details[itrack].start()) % length;
+            true_seg_end = true_seg_start + seg_details[itrack].length() - 1;
+            clipped = (dir == INC_DIRECTION ? true_seg_start != start : true_seg_end != end);
+
 
             /* Determine if we are a wire startpoint */
             is_endpoint = (seg_num == start);
             if (DEC_DIRECTION == seg_details[itrack].direction()) {
                 is_endpoint = (seg_num == end);
             }
+            isdangling = false;
+            if (is_endpoint && is_dangling_side) {
+                if (clipped) {
+                    isdangling = true;
+                }
+            }
+
+            if (seg_details[itrack].part_idx() > 0 && !isdangling)
+                continue;
+
 
             /* Count the labels and load if LOAD pass */
             if (is_endpoint) {
@@ -2443,6 +3119,92 @@ static int* label_wire_muxes(const int chan_num,
 
     return labels;
 }
+
+static int* label_incoming_bend_wires_ending(const int chan_num,
+                                             const int seg_num,
+                                             const t_chan_seg_details* seg_details,
+                                             const int seg_type_index,
+                                             const int max_len,
+                                             const enum e_direction dir,
+                                             const int max_chan_width,
+                                             int* num_incoming_bend,
+                                             bool is_dangling_side) {
+    /* Labels the incoming ending of bend wires on that side (seg_num, chan_num, direction).
+     * The returned array maps a track # to a label: array[0] = <the new hash value/label for track 0>,
+     * the labels 0,1,2,.. identify consecutive incoming wires that have sblock (passing wires with sblock and ending wires) */
+
+    int itrack, start, end, pass;
+    int* labels = nullptr;
+    bool is_endpoint, isdangling;
+    int num_labels;
+    int true_seg_start, true_seg_end, length;
+    bool clipped;
+
+    /* COUNT pass then a LOAD pass */
+    num_labels = 0;
+    for (pass = 0; pass < 2; ++pass) {
+        /* Alloc the list on LOAD pass */
+        if (pass > 0) {
+            labels = (int*)vtr::malloc(sizeof(int) * num_labels);
+            num_labels = 0;
+        }
+
+        /* Find the tracks that are starting. */
+        for (itrack = 0; itrack < max_chan_width; ++itrack) {
+            start = get_seg_start(seg_details, itrack, chan_num, seg_num);
+            end = get_seg_end(seg_details, itrack, start, chan_num, max_len);
+
+            /* Skip tracks that are undefined */
+            if (seg_details[itrack].length() == 0) {
+                continue;
+            }
+
+            /* Skip tracks going the wrong way */
+            if (seg_details[itrack].direction() != dir) {
+                continue;
+            }
+
+            if (seg_type_index != UNDEFINED) {
+                /* skip tracks that don't belong to the specified segment type */
+                if (seg_details[itrack].index() != seg_type_index) {
+                    continue;
+                }
+            }
+
+            length = seg_details[itrack].length();
+            true_seg_start = seg_num - (seg_num + length + chan_num - seg_details[itrack].start()) % length;
+            true_seg_end = true_seg_start + seg_details[itrack].length() - 1;
+            clipped = (dir == DEC_DIRECTION ? true_seg_start != start : true_seg_end != end);
+
+            /* Determine if we are a wire endpoint */
+            is_endpoint = (seg_num == end);
+            if (DEC_DIRECTION == seg_details[itrack].direction()) {
+                is_endpoint = (seg_num == start);
+            }
+
+            isdangling = false;
+            if (is_endpoint && is_dangling_side) {
+                if (clipped) {
+                    isdangling = true;
+                }
+            }
+
+            /* Skip tracks that in the middle of bend segment */
+            if (seg_details[itrack].part_idx() < seg_details[itrack].bend_len() - 1 && is_endpoint && !isdangling) {
+                if (pass > 0) {
+                    labels[num_labels] = itrack;
+                }
+                num_labels++;
+                continue;
+            }
+        }
+    }
+
+    *num_incoming_bend = num_labels;
+
+    return labels;
+}
+
 
 static int* label_incoming_wires(const int chan_num,
                                  const int seg_num,

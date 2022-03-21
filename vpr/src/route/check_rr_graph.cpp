@@ -485,6 +485,9 @@ static void check_unbuffered_edges(int from_node) {
 
         if (device_ctx.rr_switch_inf[from_switch_type].buffered())
             continue;
+        if (device_ctx.rr_switch_inf[from_switch_type].type() == SwitchType::UNISHORT)
+            continue;
+
 
         /* We know that we have a pass transistor from from_node to to_node. Now *
          * check that there is a corresponding edge from to_node back to         *
@@ -549,6 +552,18 @@ static void check_rr_edge(int from_node, int iedge, int to_node) {
         case SwitchType::PASS_GATE: //Fallthrough
         case SwitchType::SHORT:     //Fallthrough
             break;                  //pass
+        case SwitchType::UNISHORT:
+            // we assume the unishort type only has 1 fan-in, which is less complicatied
+            if (to_fanin != 1) {
+                std::string msg = "Non-configurable unishort type switch must have only one driver. ";
+                msg += vtr::string_fmt(" Actual fan-in was %d (expected 1).\n", to_fanin);
+                msg += "  Possible cause is complex block output pins connecting to:\n";
+                msg += "    " + describe_rr_node(to_node);
+
+                VPR_THROW(VPR_ERROR_ROUTE, msg.c_str());
+            }
+            break;
+
         default:
             VPR_THROW(VPR_ERROR_ROUTE, "Invalid switch type %d", switch_type);
     }

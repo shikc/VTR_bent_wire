@@ -237,6 +237,7 @@ float get_lookahead_map_cost(int from_node_ind, int to_node_ind, float criticali
     Cost_Entry cost_entry = f_cost_map[from_chan_index][from_seg_index][delta_x][delta_y];
     float expected_delay = cost_entry.delay;
     float expected_congestion = cost_entry.congestion;
+    VTR_ASSERT(expected_delay > 0 && expected_congestion > 0);
 
     float expected_cost = criticality_fac * expected_delay + (1.0 - criticality_fac) * expected_congestion;
     return expected_cost;
@@ -482,10 +483,14 @@ static Cost_Entry get_nearby_cost_entry(int x, int y, int segment_index, int cha
     int copy_x, copy_y;
     if (slope >= 1.0) {
         copy_y = y - 1;
-        copy_x = vtr::nint((float)y / slope);
+         //copy_x = vtr::nint((float)y / slope);
+        copy_x = vtr::nint((float)copy_y / slope);
+
     } else {
         copy_x = x - 1;
-        copy_y = vtr::nint((float)x * slope);
+        //copy_y = vtr::nint((float)x * slope);
+        copy_y = vtr::nint((float)copy_x * slope);
+
     }
 
     //VTR_ASSERT(copy_x > 0 || copy_y > 0); //Asertion fails in practise. TODO: debug

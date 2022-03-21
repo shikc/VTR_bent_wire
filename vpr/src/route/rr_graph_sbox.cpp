@@ -194,3 +194,46 @@ int get_simple_switch_block_track(const enum e_side from_side,
 
     return (to_track);
 }
+/* This routine connect ending point of the bend segment to the opposite side*/
+int get_wilton_like_straight_sblock(const enum e_side to_side, const int from_track, const enum e_switch_dir_type dir_type, const int nodes_per_chan) {
+    /* We assume Fs = 3 */
+
+    int to_track = SBOX_ERROR; /* Can check to see if it's not set later. */
+
+    if (dir_type == DOWN_TYPE) {
+        if (to_side == RIGHT) {                                                /* CHANX to CHANX */
+            to_track = (nodes_per_chan + from_track - 1) % nodes_per_chan;     // left -> bottom
+        } else if (to_side == TOP) {                                           /* from CHANX to CHANY */
+            to_track = (2 * nodes_per_chan - 2 - from_track) % nodes_per_chan; // bottom -> right
+        } else if (to_side == BOTTOM) {
+            to_track = (nodes_per_chan - (from_track % nodes_per_chan)) % nodes_per_chan; // top -> left
+        } else if (to_side == LEFT) {
+            to_track = (nodes_per_chan + from_track - 1) % nodes_per_chan; // right -> top
+        }
+    }
+
+    else if (dir_type == UP_TYPE) {
+        if (to_side == LEFT) {
+            to_track = (2 * nodes_per_chan - 2 - from_track) % nodes_per_chan; // right -> bottom
+        } else if (to_side == TOP) {
+            to_track = (from_track + 1) % nodes_per_chan;
+            ; // bottom -> left
+        } else if (to_side == BOTTOM) {
+            to_track = (from_track + 1) % nodes_per_chan; // top -> right
+        } else if (to_side == RIGHT) {
+            to_track = (nodes_per_chan - (from_track % nodes_per_chan)) % nodes_per_chan; // left -> top
+        }
+    }
+
+    else if (dir_type == NORMAL_TYPE) {
+        to_track = (from_track + 1) % nodes_per_chan;
+    }
+
+    /* Force to_track to UN_SET if it falls outside the min/max channel width range */
+    if (to_track < 0 || to_track >= nodes_per_chan) {
+        to_track = -1;
+    }
+
+    return (to_track);
+}
+

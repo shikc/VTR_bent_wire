@@ -52,10 +52,45 @@ void alloc_and_load_rr_indexed_data(const std::vector<t_segment_inf>& segment_in
                                     int wire_to_ipin_switch,
                                     enum e_base_cost_type base_cost_type) {
     int iseg, length, i, index;
+    /* reload the num_segment, cut off the bend segment */
+    int real_num_segment = 0;
+    vector<int> real_length;
+    vector<bool> segment_longline;
+    vector<int> real_seg_index;
+    for (iseg = 0; iseg < segment_inf.size(); iseg++) {
+        if (segment_inf[iseg].isbend) {
+            int tmp_length = 1;
+            for (auto bend_seg = segment_inf[iseg].bend.begin(); bend_seg != segment_inf[iseg].bend.end(); bend_seg++) {
+                if (*bend_seg != 0) {
+                    real_length.push_back(tmp_length);
+                    segment_longline.push_back(segment_inf[iseg].longline);
+                    real_seg_index.push_back(iseg);
+                    real_num_segment++;
+                    tmp_length = 1;
+                } else {
+                    tmp_length++;
+                }
+            }
+            // the last part
+            real_num_segment++;
+            real_length.push_back(tmp_length);
+            segment_longline.push_back(segment_inf[iseg].longline);
+            real_seg_index.push_back(iseg);
+        } else {
+            real_length.push_back(segment_inf[iseg].length);
+            segment_longline.push_back(segment_inf[iseg].longline);
+            real_seg_index.push_back(iseg);
+            real_num_segment++;
+        }
+    }
+
+    VTR_ASSERT(real_length.size() == segment_longline.size());
+    VTR_ASSERT(real_length.size() == segment_longline.size());
+
 
     auto& device_ctx = g_vpr_ctx.mutable_device();
     int num_segment = segment_inf.size();
-    int num_rr_indexed_data = CHANX_COST_INDEX_START + (2 * num_segment);
+    int num_rr_indexed_data = CHANX_COST_INDEX_START + (2 * real_num_segment);
     device_ctx.rr_indexed_data.resize(num_rr_indexed_data);
 
     /* For rr_types that aren't CHANX or CHANY, base_cost is valid, but most     *
@@ -74,52 +109,52 @@ void alloc_and_load_rr_indexed_data(const std::vector<t_segment_inf>& segment_in
     device_ctx.rr_indexed_data[IPIN_COST_INDEX].T_linear = device_ctx.rr_switch_inf[wire_to_ipin_switch].Tdel;
 
     /* X-directed segments. */
-    for (iseg = 0; iseg < num_segment; iseg++) {
+    for (iseg = 0; iseg < real_num_segment; iseg++) {
         index = CHANX_COST_INDEX_START + iseg;
 
-        if ((index + num_segment) >= (int)device_ctx.rr_indexed_data.size()) {
+        if ((index + real_num_segment) >= (int)device_ctx.rr_indexed_data.size()) {
             device_ctx.rr_indexed_data[index].ortho_cost_index = index;
         } else {
-            device_ctx.rr_indexed_data[index].ortho_cost_index = index + num_segment;
+            device_ctx.rr_indexed_data[index].ortho_cost_index = index + real_num_segment;
         }
 
         if (segment_inf[iseg].longline)
             length = device_ctx.grid.width();
         else
-            length = std::min<int>(segment_inf[iseg].length, device_ctx.grid.width());
-
+            length = std::min<int>(real_length[iseg], device_ctx.grid.width());
         device_ctx.rr_indexed_data[index].inv_length = 1. / length;
-        device_ctx.rr_indexed_data[index].seg_index = iseg;
+        device_ctx.rr_indexed_data[index].seg_index =  real_seg_index[iseg];
     }
-    load_rr_indexed_data_T_values(CHANX_COST_INDEX_START, num_segment, CHANX,
+    load_rr_indexed_data_T_values(CHANX_COST_INDEX_START, real_num_segment, CHANX,
                                   nodes_per_chan, L_rr_node_indices);
 
     /* Y-directed segments. */
-    for (iseg = 0; iseg < num_segment; iseg++) {
-        index = CHANX_COST_INDEX_START + num_segment + iseg;
+    for (iseg = 0; iseg < real_num_segment; iseg++) {
+        index = CHANX_COST_INDEX_START + real_num_segment + iseg;
 
-        if ((index - num_segment) < CHANX_COST_INDEX_START) {
+        if ((index - real_num_segment) < CHANX_COST_INDEX_START) {
             device_ctx.rr_indexed_data[index].ortho_cost_index = index;
         } else {
-            device_ctx.rr_indexed_data[index].ortho_cost_index = index - num_segment;
+            device_ctx.rr_indexed_data[index].ortho_cost_index = index - real_num_segment;
         }
 
         if (segment_inf[iseg].longline)
             length = device_ctx.grid.height();
         else
-            length = std::min<int>(segment_inf[iseg].length, device_ctx.grid.height());
+            length = std::min<int>(real_length[iseg], device_ctx.grid.height());
 
         device_ctx.rr_indexed_data[index].inv_length = 1. / length;
-        device_ctx.rr_indexed_data[index].seg_index = iseg;
+        device_ctx.rr_indexed_data[index].seg_index = real_seg_index[iseg];
     }
-    load_rr_indexed_data_T_values((CHANX_COST_INDEX_START + num_segment),
-                                  num_segment, CHANY, nodes_per_chan, L_rr_node_indices);
+    load_rr_indexed_data_T_values((CHANX_COST_INDEX_START + real_num_segment),
+                                  real_num_segment, CHANY, nodes_per_chan, L_rr_node_indices);
+
 
     load_rr_indexed_data_base_costs(nodes_per_chan, L_rr_node_indices,
                                     base_cost_type);
 }
 
-void load_rr_index_segments(const int num_segment) {
+void load_rr_index_segments(const int num_segment, const std::vector<t_segment_inf>& segment_inf) {
     auto& device_ctx = g_vpr_ctx.mutable_device();
     int iseg, i, index;
 
@@ -128,14 +163,45 @@ void load_rr_index_segments(const int num_segment) {
     }
 
     /* X-directed segments. */
+    int index_offset = 0;
     for (iseg = 0; iseg < num_segment; iseg++) {
-        index = CHANX_COST_INDEX_START + iseg;
-        device_ctx.rr_indexed_data[index].seg_index = iseg;
+        //index = CHANX_COST_INDEX_START + iseg;
+        //device_ctx.rr_indexed_data[index].seg_index = iseg;
+        index = CHANX_COST_INDEX_START + iseg + index_offset;
+        /* get the real index */
+        if (segment_inf[iseg].isbend) {
+            device_ctx.rr_indexed_data[index].seg_index = iseg;
+            for (auto bend_seg = segment_inf[iseg].bend.begin(); bend_seg != segment_inf[iseg].bend.end(); bend_seg++) {
+                if (*bend_seg != 0) {
+                    index++;
+                    index_offset++;
+                    device_ctx.rr_indexed_data[index].seg_index = iseg;
+                }
+            }
+        } else {
+            device_ctx.rr_indexed_data[index].seg_index = iseg;
+        }
+
     }
     /* Y-directed segments. */
     for (iseg = 0; iseg < num_segment; iseg++) {
-        index = CHANX_COST_INDEX_START + num_segment + iseg;
-        device_ctx.rr_indexed_data[index].seg_index = iseg;
+        //index = CHANX_COST_INDEX_START + num_segment + iseg;
+        //device_ctx.rr_indexed_data[index].seg_index = iseg;
+        index = CHANX_COST_INDEX_START + num_segment + index_offset + iseg;
+        /* get the real index */
+        if (segment_inf[iseg].isbend) {
+            device_ctx.rr_indexed_data[index].seg_index = iseg;
+            for (auto bend_seg = segment_inf[iseg].bend.begin(); bend_seg != segment_inf[iseg].bend.end(); bend_seg++) {
+                if (*bend_seg != 0) {
+                    index++;
+                    index_offset++;
+                    device_ctx.rr_indexed_data[index].seg_index = iseg;
+                }
+            }
+        } else {
+            device_ctx.rr_indexed_data[index].seg_index = iseg;
+        }
+
     }
 }
 

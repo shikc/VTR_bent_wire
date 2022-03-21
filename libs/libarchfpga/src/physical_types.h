@@ -234,7 +234,11 @@ typedef enum e_power_estimation_method_ t_power_estimation_method;
 enum e_sb_location {
     E_PERIMETER = 0,
     E_CORNER,
-    E_FRINGE, /* perimeter minus corners */
+    E_FRINGE_LEFT, /* perimeter minus corners */
+    E_FRINGE_RIGHT,
+    E_FRINGE_BOTTOM,
+    E_FRINGE_TOP,
+/* perimeter minus corners */
     E_CORE,
     E_EVERYWHERE
 };
@@ -1199,6 +1203,9 @@ struct t_segment_inf {
     enum e_directionality directionality;
     std::vector<bool> cb;
     std::vector<bool> sb;
+    bool isbend;
+    std::vector<int> bend;
+
     //float Cmetal_per_m; /* Wire capacitance (per meter) */
 };
 
@@ -1207,12 +1214,12 @@ enum class SwitchType {
     TRISTATE,  //A configurable tristate-able buffer (multi-driver)
     PASS_GATE, //A configurable pass transitor switch (multi-driver)
     SHORT,     //A non-configurable electrically shorted connection (multi-driver)
+    UNISHORT, 
     BUFFER,    //A non-configurable non-tristate-able buffer (uni-driver)
     INVALID,   //Unspecified, usually an error
     NUM_SWITCH_TYPES
 };
-constexpr std::array<const char*, size_t(SwitchType::NUM_SWITCH_TYPES)> SWITCH_TYPE_STRINGS = {{"MUX", "TRISTATE", "PASS_GATE", "SHORT", "BUFFER", "INVALID"}};
-
+constexpr std::array<const char*, size_t(SwitchType::NUM_SWITCH_TYPES)> SWITCH_TYPE_STRINGS = {{"MUX", "TRISTATE", "PASS_GATE", "SHORT", "UNISHORT", "BUFFER", "INVALID"}};
 enum class BufferSize {
     AUTO,
     ABSOLUTE
@@ -1355,6 +1362,24 @@ struct t_direct_inf {
     e_side to_side;
     int line;
 };
+
+struct t_fast_con_inf {
+    char* name;
+    char* from_type;
+    char* to_type;
+    int x_offset;
+    int y_offset;
+    int z_offset;
+    int switch_type;
+};
+
+/* for bend segment */
+struct t_bend_wires {
+    int bend_group;
+    std::vector<int> from_wires;
+    std::vector<int> to_wires;
+};
+
 
 enum class SwitchPointOrder {
     FIXED,   //Switchpoints are ordered as specified in architecture

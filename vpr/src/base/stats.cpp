@@ -104,6 +104,11 @@ void length_and_bends_stats() {
     int segments, total_segments, max_segments;
     float av_bends, av_length, av_segments;
     int num_global_nets, num_clb_opins_reserved;
+    int hard_points, switch_points;
+    int bend_hard_points, bend_switch_points;
+    int total_used_hard_points, total_used_switch_points;
+    int total_bend_hard_points, total_bend_switch_points;
+
 
     auto& cluster_ctx = g_vpr_ctx.clustering();
 
@@ -115,16 +120,28 @@ void length_and_bends_stats() {
     total_segments = 0;
     num_global_nets = 0;
     num_clb_opins_reserved = 0;
+    total_used_hard_points = 0;
+    total_used_switch_points = 0;
+
+    total_bend_hard_points = 0;
+    total_bend_switch_points = 0;
+
 
     for (auto net_id : cluster_ctx.clb_nlist.nets()) {
         if (!cluster_ctx.clb_nlist.net_is_ignored(net_id) && cluster_ctx.clb_nlist.net_sinks(net_id).size() != 0) { /* Globals don't count. */
-            get_num_bends_and_length(net_id, &bends, &length, &segments);
+            get_num_bends_and_length(net_id, &bends, &length, &segments, &hard_points, &switch_points, &bend_hard_points, &bend_switch_points);
 
             total_bends += bends;
             max_bends = max(bends, max_bends);
 
             total_length += length;
             max_length = max(length, max_length);
+            total_used_hard_points += hard_points;
+            total_used_switch_points += switch_points;
+
+            total_bend_hard_points += bend_hard_points;
+            total_bend_switch_points += bend_switch_points;
+
 
             total_segments += segments;
             max_segments = max(segments, max_segments);
@@ -137,6 +154,9 @@ void length_and_bends_stats() {
 
     av_bends = (float)total_bends / (float)((int)cluster_ctx.clb_nlist.nets().size() - num_global_nets);
     VTR_LOG("\n");
+    VTR_LOG("Total bends: %d\n", total_bends);
+    VTR_LOG("Total used hard points: %d  bend_hard_points: %d\n", total_used_hard_points, total_bend_hard_points);
+    VTR_LOG("Total used switch points: %d bend_switch_points: %d radio: %.3f\n", total_used_switch_points, total_bend_switch_points, float(total_bend_switch_points) / float(total_used_switch_points));
     VTR_LOG("Average number of bends per net: %#g  Maximum # of bends: %d\n", av_bends, max_bends);
     VTR_LOG("\n");
 
@@ -156,8 +176,12 @@ void length_and_bends_stats() {
 }
 
 static void get_channel_occupancy_stats() {
+    FILE* congestion_fp;
+    congestion_fp = fopen("congestion_infos.csv", "w");
+
     /* Determines how many tracks are used in each channel.                    */
     auto& device_ctx = g_vpr_ctx.device();
+    fprintf(congestion_fp, "%zu,%zu\n", device_ctx.grid.height(), device_ctx.grid.width());
 
     auto chanx_occ = vtr::Matrix<int>({{
                                           device_ctx.grid.width(),     //[0 .. device_ctx.grid.width() - 1] (length of x channel)
@@ -210,6 +234,24 @@ static void get_channel_occupancy_stats() {
     VTR_LOG("\n");
     VTR_LOG("Total tracks in x-direction: %d, in y-direction: %d\n", total_x, total_y);
     VTR_LOG("\n");
+    for (size_t j = 0; j < device_ctx.grid.height() - 1; ++j) {
+        fprintf(congestion_fp, "%d", chanx_occ[0][j]);
+        for (size_t i = 1; i < device_ctx.grid.width() - 1; ++i) {
+            fprintf(congestion_fp, ",%d", chanx_occ[i][j]);
+        }
+        fprintf(congestion_fp, "\n");
+    }
+    fprintf(congestion_fp, "\n");
+    for (size_t j = 0; j < device_ctx.grid.height() - 1; ++j) {
+        fprintf(congestion_fp, "%d", chany_occ[0][j]);
+        for (size_t i = 1; i < device_ctx.grid.width() - 1; ++i) {
+            fprintf(congestion_fp, ",%d", chany_occ[i][j]);
+        }
+        fprintf(congestion_fp, "\n");
+    }
+
+    fclose(congestion_fp);
+
 }
 
 /* Loads the two arrays passed in with the total occupancy at each of the  *
@@ -261,20 +303,33 @@ static void load_channel_occupancies(vtr::Matrix<int>& chanx_occ, vtr::Matrix<in
     }
 }
 
-void get_num_bends_and_length(ClusterNetId inet, int* bends_ptr, int* len_ptr, int* segments_ptr) {
+void get_num_bends_and_length(ClusterNetId inet, int* bends_ptr, int* len_ptr, int* segments_ptr, 
+                                int* hard_points_ptr, int* switch_points_ptr, 
+                                int* bend_hard_points_ptr, int* bend_switch_points_ptr) {
+
+
+//void get_num_bends_and_length(ClusterNetId inet, int* bends_ptr, int* len_ptr, int* segments_ptr) {
     /* Counts and returns the number of bends, wirelength, and number of routing *
      * resource segments in net inet's routing.                                  */
     auto& route_ctx = g_vpr_ctx.routing();
     auto& device_ctx = g_vpr_ctx.device();
 
     t_trace *tptr, *prevptr;
-    int inode;
+    int inode, prev_node;
     t_rr_type curr_type, prev_type;
     int bends, length, segments;
+    int hard_points, switch_points;
+    int bend_hard_points, bend_switch_points;
+
 
     bends = 0;
     length = 0;
     segments = 0;
+    hard_points = 0;
+    switch_points = 0;
+    bend_hard_points = 0;
+    bend_switch_points = 0;
+
 
     prevptr = route_ctx.trace[inet].head; /* Should always be SOURCE. */
     if (prevptr == nullptr) {
@@ -283,6 +338,7 @@ void get_num_bends_and_length(ClusterNetId inet, int* bends_ptr, int* len_ptr, i
     }
     inode = prevptr->index;
     prev_type = device_ctx.rr_nodes[inode].type();
+    prev_node = inode;
 
     tptr = prevptr->next;
 
@@ -305,15 +361,39 @@ void get_num_bends_and_length(ClusterNetId inet, int* bends_ptr, int* len_ptr, i
 
             if (curr_type != prev_type && (prev_type == CHANX || prev_type == CHANY))
                 bends++;
+            if (prev_type == CHANX || prev_type == CHANY) {
+                short iedge;
+                for (iedge = 0; iedge < device_ctx.rr_nodes[prev_node].edges().size(); iedge++) {
+                    if (device_ctx.rr_nodes[prev_node].edge_sink_node(iedge) == inode)
+                        break;
+                }
+
+                if (device_ctx.rr_switch_inf[device_ctx.rr_nodes[prev_node].edge_switch(iedge)].type() == SwitchType::UNISHORT) {
+                    hard_points++;
+                    if (curr_type != prev_type)
+                        bend_hard_points++;
+                } else {
+                    switch_points++;
+                    if (curr_type != prev_type)
+                        bend_switch_points++;
+                }
+            }
+
         }
 
         prev_type = curr_type;
+        prev_node = tptr->index;
         tptr = tptr->next;
     }
 
     *bends_ptr = bends;
     *len_ptr = length;
     *segments_ptr = segments;
+    *hard_points_ptr = hard_points;
+    *switch_points_ptr = switch_points;
+    *bend_hard_points_ptr = bend_hard_points;
+    *bend_switch_points_ptr = bend_switch_points;
+
 }
 
 void print_wirelen_prob_dist() {
@@ -328,6 +408,9 @@ void print_wirelen_prob_dist() {
     int bends, length, segments, index;
     float av_length;
     int prob_dist_size, i, incr;
+    int hard_points, switch_points;
+    int bend_hard_points, bend_switch_points;
+
 
     prob_dist_size = device_ctx.grid.width() + device_ctx.grid.height() + 10;
     prob_dist = (float*)vtr::calloc(prob_dist_size, sizeof(float));
@@ -335,7 +418,9 @@ void print_wirelen_prob_dist() {
 
     for (auto net_id : cluster_ctx.clb_nlist.nets()) {
         if (!cluster_ctx.clb_nlist.net_is_ignored(net_id) && cluster_ctx.clb_nlist.net_sinks(net_id).size() != 0) {
-            get_num_bends_and_length(net_id, &bends, &length, &segments);
+             //get_num_bends_and_length(net_id, &bends, &length, &segments);
+            get_num_bends_and_length(net_id, &bends, &length, &segments, &hard_points, &switch_points, &bend_hard_points, &bend_switch_points);
+
 
             /*  Assign probability to two integer lengths proportionately -- i.e.  *
              *  if two_point_length = 1.9, add 0.9 of the pins to prob_dist[2] and *

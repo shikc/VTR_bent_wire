@@ -330,11 +330,21 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
      * the partial sums together.                                               */
 
     double ntrans;
+    long sum_fan_in;
 
     /* Buffer from the routing to the ipin cblock inputs. Assume minimum size n *
      * transistors, and ptransistors sized to make the pull-up R = pull-down R */
 
     float trans_track_to_cblock_buf;
+
+    /* Buffer from the fast routing to the ipin cblock inputs. I think it is enough using     *
+	 * 1x minimum drive strength cause the direct connection only used to drive on input pin  *
+	 * see 																					  *
+	 * 		Roopchansingh, A. and Rose, J., 2002,											  *
+	 * 		Nearest Neighbour Interconnect Architecture in Deep Submicron FPGAs. CICC 2002    *
+	 * 																						  */
+    float trans_track_to_cblock_buf_direct;
+
 
     max_inputs_to_cblock = 0;
 
@@ -345,8 +355,12 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
     if (INCLUDE_TRACK_BUFFERS) {
         trans_track_to_cblock_buf = trans_per_buf(R_minW_nmos / 4., R_minW_nmos,
                                                   R_minW_pmos);
+        trans_track_to_cblock_buf_direct = trans_per_buf(R_minW_nmos / 1., R_minW_nmos,
+                                                         R_minW_pmos);
+
     } else {
         trans_track_to_cblock_buf = 0;
+        trans_track_to_cblock_buf_direct = 0;
     }
 
     num_inputs_to_cblock = (int*)vtr::calloc(device_ctx.rr_nodes.size(), sizeof(int));
@@ -354,6 +368,7 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
     cblock_counted = (bool*)vtr::calloc(maxlen, sizeof(bool));
 
     ntrans = 0;
+    sum_fan_in = 0;
     for (size_t from_node = 0; from_node < device_ctx.rr_nodes.size(); from_node++) {
         from_rr_type = device_ctx.rr_nodes[from_node].type();
 
@@ -394,7 +409,9 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
                                     /* The buffer size should already have been auto-sized (if required) when
                                      * the rr switches were created from the arch switches */
                                     ntrans += device_ctx.rr_switch_inf[switch_index].buf_size;
-                                } else if (switch_type == SwitchType::SHORT) {
+                                    sum_fan_in += fan_in;
+                                } else if (switch_type == SwitchType::SHORT || switch_type == SwitchType::UNISHORT) {
+                                    VTR_ASSERT(fan_in == 1);
                                     ntrans += 0.; //Electrical shorts contribute no transisitor area
                                 } else if (switch_type == SwitchType::BUFFER) {
                                     if (fan_in != 1) {
@@ -452,6 +469,28 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
                 }
                 break;
             case OPIN:
+                num_edges = device_ctx.rr_nodes[from_node].num_edges();
+                /* Increment number of inputs per cblock if IPIN */
+                for (iedge = 0; iedge < num_edges; iedge++) {
+                    to_node = device_ctx.rr_nodes[from_node].edge_sink_node(iedge);
+                    to_rr_type = device_ctx.rr_nodes[to_node].type();
+
+                    /* Ignore any uninitialized rr_graph nodes */
+                    if ((device_ctx.rr_nodes[to_node].type() == SOURCE)
+                        && (device_ctx.rr_nodes[to_node].xlow() == 0) && (device_ctx.rr_nodes[to_node].ylow() == 0)
+                        && (device_ctx.rr_nodes[to_node].xhigh() == 0) && (device_ctx.rr_nodes[to_node].yhigh() == 0)) {
+                        continue;
+                    }
+
+                    if (to_rr_type == IPIN) {
+                        num_inputs_to_cblock[to_node]++;
+                        max_inputs_to_cblock = max(max_inputs_to_cblock,
+                                                   num_inputs_to_cblock[to_node]);
+
+                        ntrans += trans_track_to_cblock_buf_direct;
+                    }
+                }
+
                 break;
 
             default:
@@ -461,10 +500,12 @@ void count_unidir_routing_transistors(std::vector<t_segment_inf>& /*segment_inf*
     }     /* End for all nodes */
 
     /* Now add in the input connection block transistors. */
+    VTR_LOG("\tsum fan in: %ld", sum_fan_in);
+    VTR_LOG("\tnTrans: %#g\n", ntrans);
 
     input_cblock_trans = get_cblock_trans(num_inputs_to_cblock, wire_to_ipin_switch,
                                           max_inputs_to_cblock, trans_sram_bit);
-
+    VTR_LOG("\tinput_cblock_trans: %#g\n", input_cblock_trans);
     free(cblock_counted);
     free(num_inputs_to_cblock);
     free(chan_node_switch_done);
@@ -528,7 +569,7 @@ alloc_and_load_unsharable_switch_trans(int num_switch, float trans_sram_bit, flo
     unsharable_switch_trans = (float*)vtr::malloc(num_switch * sizeof(float));
 
     for (i = 0; i < num_switch; i++) {
-        if (device_ctx.rr_switch_inf[i].type() == SwitchType::SHORT) {
+        if (device_ctx.rr_switch_inf[i].type() == SwitchType::SHORT || device_ctx.rr_switch_inf[i].type() == SwitchType::UNISHORT) {
             //Electrical shorts do not use any transistors
             unsharable_switch_trans[i] = 0.;
         } else {

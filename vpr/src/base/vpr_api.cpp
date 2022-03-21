@@ -916,7 +916,7 @@ void free_device(const t_det_routing_arch& routing_arch) {
     device_ctx.chan_width.y_list.clear();
     device_ctx.chan_width.max = device_ctx.chan_width.x_max = device_ctx.chan_width.y_max = device_ctx.chan_width.x_min = device_ctx.chan_width.y_min = 0;
 
-    for (int iswitch : {routing_arch.delayless_switch, routing_arch.global_route_switch}) {
+    for (int iswitch : {routing_arch.delayless_switch, routing_arch.global_route_switch, routing_arch.bend_delayless_switch}) {
         if (device_ctx.arch_switch_inf[iswitch].name) {
             vtr::free(device_ctx.arch_switch_inf[iswitch].name);
             device_ctx.arch_switch_inf[iswitch].name = nullptr;
@@ -1087,6 +1087,108 @@ bool vpr_analysis_flow(t_vpr_setup& vpr_setup, const t_arch& Arch, const RouteSt
     return true;
 }
 
+static void print_analyze_route_info(vtr::vector<ClusterNetId, float*>& net_delay) {
+    int inode, ilow, jlow, iclass;
+    t_rr_type rr_type;
+    t_trace* tptr;
+    FILE* analyze_fp;
+    analyze_fp = fopen("analyze_route_infos.txt", "w");
+
+    auto& place_ctx = g_vpr_ctx.placement();
+    auto& device_ctx = g_vpr_ctx.device();
+    auto& cluster_ctx = g_vpr_ctx.clustering();
+    auto& route_ctx = g_vpr_ctx.mutable_routing();
+    auto& net_rr_terminals = route_ctx.net_rr_terminals;
+
+    fprintf(analyze_fp, "Array size: %zu x %zu logic blocks.\n", device_ctx.grid.width(), device_ctx.grid.height());
+    for (auto net_id : cluster_ctx.clb_nlist.nets()) {
+        if (!cluster_ctx.clb_nlist.net_is_global(net_id)) {
+            fprintf(analyze_fp, "\n\nNet %zu (%s)\n\n", size_t(net_id), cluster_ctx.clb_nlist.net_name(net_id).c_str());
+            if (cluster_ctx.clb_nlist.net_sinks(net_id).size() == false) {
+                fprintf(analyze_fp, "\n\nUsed in local cluster only, reserved one CLB pin\n\n");
+            } else {
+                tptr = route_ctx.trace[net_id].head;
+                while (tptr != nullptr) {
+                    inode = tptr->index;
+                    rr_type = device_ctx.rr_nodes[inode].type();
+                    ilow = device_ctx.rr_nodes[inode].xlow();
+                    jlow = device_ctx.rr_nodes[inode].ylow();
+
+                    fprintf(analyze_fp, "Node:\t%d\t%6s (%d,%d) ", inode,
+                            device_ctx.rr_nodes[inode].type_string(), ilow, jlow);
+
+                    if ((ilow != device_ctx.rr_nodes[inode].xhigh())
+                        || (jlow != device_ctx.rr_nodes[inode].yhigh()))
+                        fprintf(analyze_fp, "to (%d,%d) ", device_ctx.rr_nodes[inode].xhigh(),
+                                device_ctx.rr_nodes[inode].yhigh());
+
+                    switch (rr_type) {
+                        case IPIN:
+                        case OPIN:
+                            if (is_io_type(device_ctx.grid[ilow][jlow].type)) {
+                                fprintf(analyze_fp, " Pad: ");
+                            } else { /* IO Pad. */
+                                fprintf(analyze_fp, " Pin: ");
+                            }
+                            break;
+
+                        case CHANX:
+                        case CHANY:
+                            fprintf(analyze_fp, " Track: ");
+                            break;
+
+                        case SOURCE:
+                        case SINK: {
+                            std::vector<int>::iterator it = find(net_rr_terminals[net_id].begin(), net_rr_terminals[net_id].end(), inode);
+                            VTR_ASSERT(it != net_rr_terminals[net_id].end());
+                            if (rr_type == SOURCE)
+                                fprintf(analyze_fp, " Delay: 0.00000");
+                            else
+                                fprintf(analyze_fp, " Delay: %.5f", 1e9 * net_delay[net_id][std::distance(net_rr_terminals[net_id].begin(), it)]);
+                            if (is_io_type(device_ctx.grid[ilow][jlow].type)) {
+                                fprintf(analyze_fp, " Pad: ");
+                            } else { /* IO Pad. */
+                                fprintf(analyze_fp, " Class: ");
+                            }
+                            break;
+                        }
+
+                        default:
+                            vpr_throw(VPR_ERROR_ROUTE, __FILE__, __LINE__,
+                                      "in print_route: Unexpected traceback element type: %d (%s).\n",
+                                      rr_type, device_ctx.rr_nodes[inode].type_string());
+                            break;
+                    }
+
+                    fprintf(analyze_fp, "%d  ", device_ctx.rr_nodes[inode].ptc_num());
+
+                    if (!is_io_type(device_ctx.grid[ilow][jlow].type) && (rr_type == IPIN || rr_type == OPIN)) {
+                        int pin_num = device_ctx.rr_nodes[inode].ptc_num();
+                        int xoffset = device_ctx.grid[ilow][jlow].width_offset;
+                        int yoffset = device_ctx.grid[ilow][jlow].height_offset;
+                        ClusterBlockId iblock = place_ctx.grid_blocks[ilow - xoffset][jlow - yoffset].blocks[0];
+                        VTR_ASSERT(iblock);
+                        t_pb_graph_pin* pb_pin = get_pb_graph_node_pin_from_block_pin(iblock, pin_num);
+                        t_pb_type* pb_type = pb_pin->parent_node->pb_type;
+                        fprintf(analyze_fp, " %s.%s[%d] ", pb_type->name, pb_pin->port->name, pb_pin->pin_number);
+                    }
+
+                    /* Uncomment line below if you're debugging and want to see the switch types *
+                     * used in the routing.                                                      */
+                    fprintf(analyze_fp, "Switch: %d", tptr->iswitch);
+
+                    fprintf(analyze_fp, "\n");
+
+                    tptr = tptr->next;
+                }
+            }
+        }
+    }
+
+    fclose(analyze_fp);
+}
+
+
 void vpr_analysis(t_vpr_setup& vpr_setup, const t_arch& Arch, const RouteStatus& route_status) {
     auto& route_ctx = g_vpr_ctx.routing();
     auto& atom_ctx = g_vpr_ctx.atom();
@@ -1103,6 +1205,7 @@ void vpr_analysis(t_vpr_setup& vpr_setup, const t_arch& Arch, const RouteStatus&
         //Load the net delays
         net_delay = alloc_net_delay(&net_delay_ch);
         load_net_delay_from_routing(net_delay);
+        //print_analyze_route_info(net_delay);
     }
 
     routing_stats(vpr_setup.RouterOpts.full_stats, vpr_setup.RouterOpts.route_type,

@@ -245,6 +245,10 @@ static bool is_corner(const DeviceGrid& grid, int x, int y);
 
 /* checks if the specified coordinates correspond to one of the perimeter switchblocks */
 static bool is_perimeter(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_left(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_right(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_bottom(const DeviceGrid& grid, int x, int y);
+static bool is_perimeter_top(const DeviceGrid& grid, int x, int y);
 
 /* checks if the specified coordinates correspond to the core of the FPGA (i.e. not perimeter) */
 static bool is_core(const DeviceGrid& grid, int x, int y);
@@ -533,8 +537,23 @@ static bool sb_not_here(const DeviceGrid& grid, int x, int y, e_sb_location loca
                 sb_not_here = false;
             }
             break;
-        case E_FRINGE:
-            if (is_perimeter(grid, x, y) && !is_corner(grid, x, y)) {
+        case E_FRINGE_LEFT:
+            if (is_perimeter_left(grid, x, y) && !is_corner(grid, x, y)) {
+                sb_not_here = false;
+            }
+            break;
+        case E_FRINGE_RIGHT:
+            if (is_perimeter_right(grid, x, y) && !is_corner(grid, x, y)) {
+                sb_not_here = false;
+            }
+            break;
+        case E_FRINGE_BOTTOM:
+            if (is_perimeter_bottom(grid, x, y) && !is_corner(grid, x, y)) {
+                sb_not_here = false;
+            }
+            break;
+        case E_FRINGE_TOP:
+            if (is_perimeter_top(grid, x, y) && !is_corner(grid, x, y)) {
                 sb_not_here = false;
             }
             break;
@@ -563,6 +582,38 @@ static bool is_perimeter(const DeviceGrid& grid, int x, int y) {
         is_perimeter = true;
     }
     return is_perimeter;
+}
+
+static bool is_perimeter_left(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_left = false;
+    if (x == 0) {
+        is_perimeter_left = true;
+    }
+    return is_perimeter_left;
+}
+
+static bool is_perimeter_right(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_right = false;
+    if (x == int(grid.width()) - 2) {
+        is_perimeter_right = true;
+    }
+    return is_perimeter_right;
+}
+
+static bool is_perimeter_top(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_top = false;
+    if (y == int(grid.height()) - 2) {
+        is_perimeter_top = true;
+    }
+    return is_perimeter_top;
+}
+
+static bool is_perimeter_bottom(const DeviceGrid& grid, int x, int y) {
+    bool is_perimeter_bottom = false;
+    if (y == 0) {
+        is_perimeter_bottom = true;
+    }
+    return is_perimeter_bottom;
 }
 
 /* checks if the specified coordinates correspond to the core of the FPGA (i.e. not perimeter) */

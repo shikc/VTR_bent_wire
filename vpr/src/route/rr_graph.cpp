@@ -170,12 +170,17 @@ static void alloc_and_load_rr_graph(const int num_nodes,
                                     const t_chan_width& chan_width,
                                     const int wire_to_ipin_switch,
                                     const int delayless_switch,
+                                    const int bend_delayless_switch,
                                     const enum e_directionality directionality,
                                     bool* Fc_clipped,
                                     const t_direct_inf* directs,
                                     const int num_directs,
                                     const t_clb_to_clb_directs* clb_to_clb_directs,
-                                    bool is_global_graph);
+                                    bool is_global_graph,
+                                    bool use_short_segment_groups,
+                                    std::map<int, int>& bend_segment_map,
+                                    const std::vector<t_segment_inf>& segment_inf);
+
 
 static float pattern_fmod(float a, float b);
 static void load_uniform_connection_block_pattern(vtr::NdMatrix<int, 5>& tracks_connected_to_pin,
@@ -235,7 +240,11 @@ static void build_rr_chan(const int i,
                           t_rr_edge_info_set& created_rr_edges,
                           std::vector<t_rr_node>& L_rr_node,
                           const int wire_to_ipin_switch,
-                          const enum e_directionality directionality);
+                          const int bend_delayless_switch,
+                          const enum e_directionality directionality,
+                          bool use_short_segment_groups,
+                          std::map<int, int>& bend_segment_map);
+
 
 void uniquify_edges(t_rr_edge_info_set& rr_edges_to_create);
 
@@ -258,7 +267,7 @@ static void rr_graph_externals(const std::vector<t_segment_inf>& segment_inf,
                                int max_chan_width,
                                int wire_to_rr_ipin_switch,
                                enum e_base_cost_type base_cost_type);
-
+static void rr_graph_change_bend_node_cost(map<int, int>& bend_segment_map);
 static t_clb_to_clb_directs* alloc_and_load_clb_to_clb_directs(const t_direct_inf* directs, const int num_directs, const int delayless_switch);
 
 static void free_type_track_to_pin_map(t_track_to_pin_lookup& track_to_pin_map,
@@ -297,6 +306,7 @@ static void build_rr_graph(const t_graph_type graph_type,
                            const int global_route_switch,
                            const int wire_to_arch_ipin_switch,
                            const int delayless_switch,
+                           const int bend_delayless_switch,
                            const float R_minW_nmos,
                            const float R_minW_pmos,
                            const enum e_base_cost_type base_cost_type,
@@ -356,6 +366,7 @@ void create_rr_graph(const t_graph_type graph_type,
                        det_routing_arch->global_route_switch,
                        det_routing_arch->wire_to_arch_ipin_switch,
                        det_routing_arch->delayless_switch,
+                       det_routing_arch->bend_delayless_switch,
                        det_routing_arch->R_minW_nmos,
                        det_routing_arch->R_minW_pmos,
                        base_cost_type,
@@ -427,6 +438,7 @@ static void build_rr_graph(const t_graph_type graph_type,
                            const int global_route_switch,
                            const int wire_to_arch_ipin_switch,
                            const int delayless_switch,
+                           const int bend_delayless_switch,
                            const float R_minW_nmos,
                            const float R_minW_pmos,
                            const enum e_base_cost_type base_cost_type,
@@ -463,6 +475,7 @@ static void build_rr_graph(const t_graph_type graph_type,
     /* START SEG_DETAILS */
     int num_seg_details = 0;
     t_seg_details* seg_details = nullptr;
+    bool use_bend_segment_groups = false;
 
     if (is_global_graph) {
         /* Sets up a single unit length segment type for global routing. */
@@ -475,7 +488,7 @@ static void build_rr_graph(const t_graph_type graph_type,
 
         seg_details = alloc_and_load_seg_details(&max_chan_width,
                                                  max_dim, segment_inf,
-                                                 use_full_seg_groups, is_global_graph, directionality,
+                                                 use_full_seg_groups, is_global_graph, directionality, use_bend_segment_groups,
                                                  &num_seg_details);
         if ((is_global_graph ? 1 : nodes_per_chan.max) != max_chan_width) {
             nodes_per_chan.max = max_chan_width;
@@ -675,6 +688,7 @@ static void build_rr_graph(const t_graph_type graph_type,
     /* END OPIN MAP */
 
     bool Fc_clipped = false;
+    std::map<int, int> bend_segment_map;
     alloc_and_load_rr_graph(device_ctx.rr_nodes.size(), device_ctx.rr_nodes, segment_inf.size(),
                             chan_details_x, chan_details_y,
                             track_to_pin_lookup, opin_to_track_map,
@@ -684,10 +698,15 @@ static void build_rr_graph(const t_graph_type graph_type,
                             nodes_per_chan,
                             wire_to_arch_ipin_switch,
                             delayless_switch,
+                            bend_delayless_switch,
                             directionality,
                             &Fc_clipped,
                             directs, num_directs, clb_to_clb_directs,
-                            is_global_graph);
+                            is_global_graph,
+                            use_bend_segment_groups,
+                            bend_segment_map,
+                            segment_inf);
+
 
     /* Update rr_nodes capacities if global routing */
     if (graph_type == GRAPH_GLOBAL) {
@@ -945,7 +964,7 @@ static void rr_graph_externals(const std::vector<t_segment_inf>& segment_inf,
     add_rr_graph_C_from_switches(device_ctx.rr_switch_inf[wire_to_rr_ipin_switch].Cin);
     alloc_and_load_rr_indexed_data(segment_inf, device_ctx.rr_node_indices,
                                    max_chan_width, wire_to_rr_ipin_switch, base_cost_type);
-    load_rr_index_segments(segment_inf.size());
+    load_rr_index_segments(segment_inf.size(), segment_inf);
 }
 
 static std::vector<std::vector<bool>> alloc_and_load_perturb_ipins(const int L_num_types,
@@ -1167,6 +1186,9 @@ static void free_type_track_to_pin_map(t_track_to_pin_lookup& track_to_pin_map,
 
 /* Does the actual work of allocating the rr_graph and filling all the *
  * appropriate values.  Everything up to this was just a prelude!      */
+static void alloc_and_load_rr_graph(const int num_nodes, vector<t_rr_node>& L_rr_node, const int num_seg_types, const t_chan_details& chan_details_x, const t_chan_details& chan_details_y, const t_track_to_pin_lookup& track_to_pin_lookup, const t_pin_to_track_lookup& opin_to_track_map, const vtr::NdMatrix<std::vector<int>, 3>& switch_block_conn, t_sb_connection_map* sb_conn_map, const DeviceGrid& grid, const int Fs, t_sblock_pattern& sblock_pattern, const vector<vtr::Matrix<int>>& Fc_out, vtr::NdMatrix<int, 3>& Fc_xofs, vtr::NdMatrix<int, 3>& Fc_yofs, const t_rr_node_indices& L_rr_node_indices, const int max_chan_width, const t_chan_width& chan_width, const int wire_to_ipin_switch, const int delayless_switch, const int bend_delayless_switch, const enum e_directionality directionality, bool* Fc_clipped, const t_direct_inf* directs, const int num_directs, const t_clb_to_clb_directs* clb_to_clb_directs, bool is_global_graph, bool use_short_segment_groups, map<int, int>& bend_segment_map, const vector<t_segment_inf>& segment_inf) {
+
+/*
 static void alloc_and_load_rr_graph(const int num_nodes,
                                     std::vector<t_rr_node>& L_rr_node,
                                     const int num_seg_types,
@@ -1187,12 +1209,17 @@ static void alloc_and_load_rr_graph(const int num_nodes,
                                     const t_chan_width& chan_width,
                                     const int wire_to_ipin_switch,
                                     const int delayless_switch,
+                                    const int bend_delayless_switch,
                                     const enum e_directionality directionality,
                                     bool* Fc_clipped,
                                     const t_direct_inf* directs,
                                     const int num_directs,
                                     const t_clb_to_clb_directs* clb_to_clb_directs,
-                                    bool is_global_graph) {
+                                    bool is_global_graph,
+                                    bool use_short_segment_groups,
+                                    std::map<int, int>& bend_segment_map,
+                                    const t_segment_inf* segment_inf) {*/
+
     //We take special care when creating RR graph edges (there are typically many more
     //edges than nodes in an RR graph).
     //
@@ -1252,6 +1279,29 @@ static void alloc_and_load_rr_graph(const int num_nodes,
             }
         }
     }
+    int real_num_segment = 0;
+    vector<int> real_length;
+    for (int iseg = 0; iseg < num_seg_types; iseg++) {
+        if (segment_inf[iseg].isbend) {
+            int tmp_length = 1;
+            for (auto bend_seg = segment_inf[iseg].bend.begin(); bend_seg != segment_inf[iseg].bend.end(); bend_seg++) {
+                if (*bend_seg != 0) {
+                    real_length.push_back(tmp_length);
+                    real_num_segment++;
+                    tmp_length = 1;
+                } else {
+                    tmp_length++;
+                }
+            }
+            // the last part
+            real_num_segment++;
+            real_length.push_back(tmp_length);
+        } else {
+            real_length.push_back(segment_inf[iseg].length);
+            real_num_segment++;
+        }
+    }
+
 
     /* Build channels */
     VTR_ASSERT(Fs % 3 == 0);
@@ -1265,7 +1315,11 @@ static void alloc_and_load_rr_graph(const int num_nodes,
                               sblock_pattern, Fs / 3, chan_details_x, chan_details_y,
                               L_rr_node_indices, rr_edges_to_create, L_rr_node,
                               wire_to_ipin_switch,
-                              directionality);
+                              bend_delayless_switch,
+                              directionality,
+                              use_short_segment_groups,
+                              bend_segment_map);
+
 
                 //Create the actual CHAN->CHAN edges
                 uniquify_edges(rr_edges_to_create);
@@ -1275,12 +1329,16 @@ static void alloc_and_load_rr_graph(const int num_nodes,
             if (j > 0) {
                 int tracks_per_chan = ((is_global_graph) ? 1 : chan_width.y_list[i]);
                 build_rr_chan(i, j, CHANY, track_to_pin_lookup, sb_conn_map, switch_block_conn,
-                              CHANX_COST_INDEX_START + num_seg_types,
+                              CHANX_COST_INDEX_START + real_num_segment,
                               max_chan_width, grid, tracks_per_chan,
                               sblock_pattern, Fs / 3, chan_details_x, chan_details_y,
                               L_rr_node_indices, rr_edges_to_create, L_rr_node,
                               wire_to_ipin_switch,
-                              directionality);
+                              bend_delayless_switch,
+                              directionality,
+                              use_short_segment_groups,
+                              bend_segment_map);
+
 
                 //Create the actual CHAN->CHAN edges
                 uniquify_edges(rr_edges_to_create);
@@ -1551,7 +1609,11 @@ static void build_rr_chan(const int x_coord,
                           t_rr_edge_info_set& rr_edges_to_create,
                           std::vector<t_rr_node>& L_rr_node,
                           const int wire_to_ipin_switch,
-                          const enum e_directionality directionality) {
+                          const int bend_delayless_switch,
+                          const enum e_directionality directionality,
+                          bool use_short_segment_groups,
+                          std::map<int, int>& bend_segment_map) {
+
     /* this function builds both x and y-directed channel segments, so set up our
      * coordinates based on channel type */
 
@@ -1586,6 +1648,9 @@ static void build_rr_chan(const int x_coord,
     for (int track = 0; track < tracks_per_chan; ++track) {
         if (seg_details[track].length() == 0)
             continue;
+        if (use_short_segment_groups && track >= max_chan_width)
+            break;
+
 
         //Start and end coordinates of this segment along the length of the channel
         //Note that these values are in the VPR coordinate system (and do not consider
@@ -1609,7 +1674,7 @@ static void build_rr_chan(const int x_coord,
         if (node == OPEN) {
             continue;
         }
-
+        bool is_bend_first = (seg_details[track].bend_len() > 0 && seg_details[track].part_idx() == 0);
         /* Add the edges from this track to all it's connected pins into the list */
         int num_edges = 0;
         num_edges += get_track_to_pins(start, chan_coord, track, tracks_per_chan, node, rr_edges_to_create,
@@ -1632,7 +1697,9 @@ static void build_rr_chan(const int x_coord,
                                                  from_seg_details, to_seg_details, opposite_chan_details,
                                                  directionality,
                                                  L_rr_node_indices,
-                                                 switch_block_conn, sb_conn_map);
+                                                 switch_block_conn, sb_conn_map,
+                                                 bend_delayless_switch, bend_segment_map);
+
             }
         }
         if (chan_coord < chan_dimension) {
@@ -1650,7 +1717,9 @@ static void build_rr_chan(const int x_coord,
                                                  from_seg_details, to_seg_details, opposite_chan_details,
                                                  directionality,
                                                  L_rr_node_indices,
-                                                 switch_block_conn, sb_conn_map);
+                                                 switch_block_conn, sb_conn_map,
+                                                 bend_delayless_switch, bend_segment_map);
+
             }
         }
 
@@ -1680,14 +1749,17 @@ static void build_rr_chan(const int x_coord,
                                                      from_seg_details, to_seg_details, from_chan_details,
                                                      directionality,
                                                      L_rr_node_indices,
-                                                     switch_block_conn, sb_conn_map);
+                                                     switch_block_conn, sb_conn_map,
+                                                    bend_delayless_switch, bend_segment_map);
+
                 }
             }
         }
 
         /* Edge arrays have now been built up.  Do everything else.  */
-        L_rr_node[node].set_cost_index(cost_index_offset + seg_details[track].index());
+        L_rr_node[node].set_cost_index(cost_index_offset + seg_details[track].cost_index());
         L_rr_node[node].set_capacity(1); /* GLOBAL routing handled elsewhere */
+        L_rr_node[node].set_bend_first_node(is_bend_first);
 
         if (chan_type == CHANX) {
             L_rr_node[node].set_coordinates(start, y_coord, end, y_coord);
@@ -2622,7 +2694,7 @@ static void build_unidir_rr_opins(const int i, const int j, const e_side side, c
                                         opin_node_index,
                                         rr_edges_to_create,
                                         Fc_ofs, max_len, max_chan_width,
-                                        L_rr_node_indices, &clipped);
+                                        L_rr_node_indices, &clipped, grid);
             if (clipped) {
                 *Fc_clipped = true;
             }
@@ -3246,3 +3318,40 @@ static void process_non_config_sets() {
     create_edge_groups(&groups);
     groups.set_device_context();
 }
+
+/* this procedure add the whole R, C value in bend segment into the first node of bend segment,
+ * since if doesn't do this, router will model the delay of bend segment higher */
+static void rr_graph_change_bend_node_cost(map<int, int>& bend_segment_map) {
+    auto& device_ctx = g_vpr_ctx.device();
+    auto& mutable_device_ctx = g_vpr_ctx.mutable_device();
+
+    map<int, vector<int>> bend_segment_list;
+    map<int, int>::iterator it;
+    for (it = bend_segment_map.begin(); it != bend_segment_map.end(); it++) {
+        int from_node = it->second;
+        int to_node = it->first;
+
+        // get the first node
+        while (bend_segment_map.count(from_node) != 0) {
+            from_node = bend_segment_map[from_node];
+        }
+        VTR_ASSERT(device_ctx.rr_nodes[from_node].is_bend_first());
+
+        bend_segment_list[from_node].push_back(to_node);
+    }
+
+    map<int, vector<int>>::iterator it_list;
+    for (it_list = bend_segment_list.begin(); it_list != bend_segment_list.end(); it_list++) {
+        int first_node = it_list->first;
+        float R = device_ctx.rr_nodes[first_node].R();
+        float C = device_ctx.rr_nodes[first_node].C();
+        for (auto iter = it_list->second.cbegin(); iter != it_list->second.cend(); iter++) {
+            int inode = *iter;
+            R += device_ctx.rr_nodes[inode].R();
+            C += device_ctx.rr_nodes[inode].C();
+            mutable_device_ctx.rr_nodes[inode].set_rc_index(find_create_rr_rc_data(0.0, 0.0));
+        }
+        mutable_device_ctx.rr_nodes[first_node].set_rc_index(find_create_rr_rc_data(R, C));
+    }
+}
+

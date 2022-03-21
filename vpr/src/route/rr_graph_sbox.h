@@ -17,5 +17,5 @@ vtr::NdMatrix<std::vector<int>, 3> alloc_and_load_switch_block_conn(size_t nodes
                                                                     int Fs);
 
 int get_simple_switch_block_track(enum e_side from_side, enum e_side to_side, int from_track, enum e_switch_block_type switch_block_type, int nodes_per_chan);
-
+int get_wilton_like_straight_sblock(const enum e_side to_side, const int from_track, const enum e_switch_dir_type dir_type, const int nodes_per_chan);
 #endif

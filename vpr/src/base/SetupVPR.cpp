@@ -248,6 +248,7 @@ static void SetupSwitches(const t_arch& Arch,
 
     /* Depends on device_ctx.num_arch_switches */
     RoutingArch->delayless_switch = device_ctx.num_arch_switches++;
+    RoutingArch->bend_delayless_switch = device_ctx.num_arch_switches++;
 
     /* Alloc the list now that we know the final num_arch_switches value */
     device_ctx.arch_switch_inf = new t_arch_switch_inf[device_ctx.num_arch_switches];
@@ -270,6 +271,18 @@ static void SetupSwitches(const t_arch& Arch,
     VTR_ASSERT_MSG(device_ctx.arch_switch_inf[RoutingArch->delayless_switch].configurable(), "Delayless switch expected to be configurable");
 
     RoutingArch->global_route_switch = RoutingArch->delayless_switch;
+    /* Bend Delayless switch for connecting middle bend segment */
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].set_type(SwitchType::UNISHORT);
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].name = vtr::strdup("__vpr_benddelayless_switch__");
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].R = 0.;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].Cin = 0.;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].Cout = 0.;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].set_Tdel(t_arch_switch_inf::UNDEFINED_FANIN, 0.);
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].power_buffer_type = POWER_BUFFER_TYPE_NONE;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].mux_trans_size = 0.;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].buf_size_type = BufferSize::ABSOLUTE;
+    device_ctx.arch_switch_inf[RoutingArch->bend_delayless_switch].buf_size = 0.;
+
 
     //Warn about non-zero Cout values for the ipin switch, since these values have no effect.
     //VPR do not model the R/C's of block internal routing connectsion.

@@ -228,6 +228,8 @@ void PrintArchInfo(FILE* Echo, const t_arch* arch) {
             fprintf(Echo, "\tSwitch[%d]: name %s type short\n", i + 1, arch->Switches[i].name);
         } else if (arch->Switches[i].type() == SwitchType::BUFFER) {
             fprintf(Echo, "\tSwitch[%d]: name %s type buffer\n", i + 1, arch->Switches[i].name);
+        } else if (arch->Switches[i].type() == SwitchType::UNISHORT) {
+            fprintf(Echo, "\tSwitch[%d]: name %s type unishort\n", i + 1, arch->Switches[i].name);
         } else {
             VTR_ASSERT(arch->Switches[i].type() == SwitchType::PASS_GATE);
             fprintf(Echo, "\tSwitch[%d]: name %s type pass_gate\n", i + 1, arch->Switches[i].name);

@@ -36,7 +36,7 @@
 #include "router_lookahead_map.h"
 
 #include "tatum/TimingReporter.hpp"
-
+#include "tatum/report/TimingPathCollector.hpp"
 #define CONGESTED_SLOPE_VAL -0.04
 //#define ROUTER_DEBUG
 
@@ -273,6 +273,8 @@ static void print_route_status(int itry,
                                const WirelengthInfo& wirelength_info,
                                std::shared_ptr<const SetupHoldTimingInfo> timing_info,
                                float est_success_iteration);
+static void print_route_debug_info(FILE* fp, int itry, std::shared_ptr<SetupTimingInfo> setup_timing_info);
+static void print_critical_path_info(FILE* fp, std::shared_ptr<SetupTimingInfo> setup_timing_info);
 
 static std::string describe_unrouteable_connection(const int source_node, const int sink_node);
 
@@ -489,6 +491,12 @@ bool try_timing_driven_route(const t_router_opts& router_opts,
         print_route_status(itry, iter_elapsed_time, pres_fac, num_net_bounding_boxes_updated, router_iteration_stats, overuse_info, wirelength_info, timing_info, est_success_iteration);
 
         prev_iter_cumm_time = iter_cumm_time;
+        // used to output net delay information
+        //print_net_delay_all_iteration(net_delay, net_delay_fp, itry);
+
+        // use to debug
+        //print_route_debug_info(route_fp, itry, timing_info);
+
 
         //Update graphics
         if (itry == 1) {
@@ -2249,6 +2257,28 @@ void Connection_based_routing_resources::set_lower_bound_connection_delays(vtr::
         }
     }
 }
+void Connection_based_routing_resources::forcibly_detailed_reroute(float max_criticality, float criticality_lower_bind, std::shared_ptr<const SetupTimingInfo> timing_info, const ClusteredPinAtomPinsLookup& netlist_pin_lookup, vtr::vector_map<ClusterNetId, float*>& net_delay) {
+    auto& cluster_ctx = g_vpr_ctx.clustering();
+    auto& route_ctx = g_vpr_ctx.routing();
+
+    for (auto net_id : cluster_ctx.clb_nlist.nets()) {
+        for (auto pin_id : cluster_ctx.clb_nlist.net_sinks(net_id)) {
+            int ipin = cluster_ctx.clb_nlist.pin_net_index(pin_id);
+            // rr sink node index corresponding to this connection terminal
+            auto rr_sink_node = route_ctx.net_rr_terminals[net_id][ipin];
+            //Clear any forced re-routing from the previuos iteration
+
+            forcible_reroute_connection_flag[net_id][rr_sink_node] = false;
+
+            // skip if connection criticality is too low (not a problem connection)
+            float pin_criticality = calculate_clb_net_pin_criticality(*timing_info, netlist_pin_lookup, pin_id);
+            if (pin_criticality < (criticality_lower_bind * max_criticality))
+                continue;
+
+            forcible_reroute_connection_flag[net_id][rr_sink_node] = true;
+        }
+    }
+}
 
 /* Run through all non-congested connections of all nets and see if any need to be forcibly rerouted.
  * The connection must satisfy all following criteria:
@@ -2357,8 +2387,9 @@ static WirelengthInfo calculate_wirelength_info() {
     for (auto net_id : cluster_ctx.clb_nlist.nets()) {
         if (!cluster_ctx.clb_nlist.net_is_ignored(net_id)
             && cluster_ctx.clb_nlist.net_sinks(net_id).size() != 0) { /* Globals don't count. */
-            int bends, wirelength, segments;
-            get_num_bends_and_length(net_id, &bends, &wirelength, &segments);
+            int bends, wirelength, segments, hard_points, switch_points, bend_hard_points, bend_switch_points;
+            get_num_bends_and_length(net_id, &bends, &wirelength, &segments, &hard_points, &switch_points, &bend_hard_points, &bend_switch_points);
+
 
             used_wirelength += wirelength;
         }
@@ -2373,6 +2404,263 @@ static void print_route_status_header() {
     VTR_LOG("Iter   Time    pres  BBs    Heap  Re-Rtd  Re-Rtd Overused RR Nodes      Wirelength      CPD       sTNS       sWNS       hTNS       hWNS Est Succ\n");
     VTR_LOG("      (sec)     fac Updt    push    Nets   Conns                                       (ns)       (ns)       (ns)       (ns)       (ns)     Iter\n");
     VTR_LOG("---- ------ ------- ---- ------- ------- ------- ----------------- --------------- -------- ---------- ---------- ---------- ---------- --------\n");
+}
+//Helper function for trace_routed_connection_rr_nodes
+//Adds the rr nodes linking rt_node to sink_rr_node to rr_nodes_on_path
+//Returns true if rt_node is on the path
+static bool trace_routed_connection_rr_nodes_recurr(const t_rt_node* rt_node, int sink_rr_node, std::vector<int>& rr_nodes_on_path) {
+    //DFS from the current rt_node to the sink_rr_node, when the sink is found trace back the used rr nodes
+
+    if (rt_node->inode == sink_rr_node) {
+        rr_nodes_on_path.push_back(sink_rr_node);
+        return true;
+    }
+
+    for (t_linked_rt_edge* edge = rt_node->u.child_list; edge != nullptr; edge = edge->next) {
+        t_rt_node* child_rt_node = edge->child;
+        VTR_ASSERT(child_rt_node);
+
+        bool on_path_to_sink = trace_routed_connection_rr_nodes_recurr(child_rt_node, sink_rr_node, rr_nodes_on_path);
+
+        if (on_path_to_sink) {
+            rr_nodes_on_path.push_back(rt_node->inode);
+            return true;
+        }
+    }
+
+    return false; //Not on path to sink
+}
+
+//Returns the set of rr nodes which connect driver to sink
+static std::vector<int> trace_routed_connection_rr_nodes(const ClusterNetId net_id, const int driver_pin, const int sink_pin) {
+    auto& route_ctx = g_vpr_ctx.routing();
+
+    bool allocated_route_tree_structs = alloc_route_tree_timing_structs(true); //Needed for traceback_to_route_tree
+
+    //Conver the traceback into an easily search-able
+    t_rt_node* rt_root = traceback_to_route_tree(net_id);
+
+    VTR_ASSERT(rt_root->inode == route_ctx.net_rr_terminals[net_id][driver_pin]);
+
+    int sink_rr_node = route_ctx.net_rr_terminals[net_id][sink_pin];
+
+    std::vector<int> rr_nodes_on_path;
+
+    //Collect the rr nodes
+    trace_routed_connection_rr_nodes_recurr(rt_root, sink_rr_node, rr_nodes_on_path);
+
+    //Traced from sink to source, but we want to draw from source to sink
+    std::reverse(rr_nodes_on_path.begin(), rr_nodes_on_path.end());
+
+    if (allocated_route_tree_structs) {
+        free_route_tree_timing_structs(); //Clean-up
+    }
+    return rr_nodes_on_path;
+}
+
+static void print_critical_path_info(FILE* fp, std::shared_ptr<SetupTimingInfo> setup_timing_info) {
+    tatum::TimingPathCollector path_collector;
+    auto& timing_ctx = g_vpr_ctx.timing();
+    auto& atom_ctx = g_vpr_ctx.atom();
+    auto& route_ctx = g_vpr_ctx.mutable_routing();
+    auto& device_rr_nodes = g_vpr_ctx.device().rr_nodes;
+    auto& cluster_ctx = g_vpr_ctx.clustering();
+
+    //Get the worst timing path
+    auto paths = path_collector.collect_worst_setup_timing_paths(*timing_ctx.graph, *(setup_timing_info->setup_analyzer()), 1);
+    for (int ipath = 0; ipath < paths.size(); ipath++) {
+        tatum::TimingPath path = paths[ipath];
+        tatum::NodeId prev_node;
+        float prev_arr_time = std::numeric_limits<float>::quiet_NaN();
+        ClusterNetId net_id = ClusterNetId::INVALID();
+
+        fprintf(fp, "\nCritical path %d :\n\n", ipath);
+        for (tatum::TimingPathElem elem : path.data_arrival_path().elements()) {
+            tatum::NodeId node = elem.node();
+            float arr_time = elem.tag().time();
+            if (prev_node) {
+                float delay = arr_time - prev_arr_time;
+
+                AtomPinId atom_src_pin = atom_ctx.lookup.tnode_atom_pin(prev_node);
+                AtomPinId atom_sink_pin = atom_ctx.lookup.tnode_atom_pin(node);
+                AtomBlockId atom_src_block = atom_ctx.nlist.pin_block(atom_src_pin);
+                AtomBlockId atom_sink_block = atom_ctx.nlist.pin_block(atom_sink_pin);
+                ClusterBlockId clb_src_block = atom_ctx.lookup.atom_clb(atom_src_block);
+                ClusterBlockId clb_sink_block = atom_ctx.lookup.atom_clb(atom_sink_block);
+                const t_pb_graph_pin* sink_gpin = atom_ctx.lookup.atom_pin_pb_graph_pin(atom_sink_pin);
+                int sink_pb_route_id = sink_gpin->pin_count_in_cluster;
+                int sink_block_pin_index = -1;
+                int sink_net_pin_index = -1;
+                char* src_name = cluster_ctx.clb_nlist.block_type(clb_src_block)->name;
+                char* sink_name = cluster_ctx.clb_nlist.block_type(clb_sink_block)->name;
+                std::tie(net_id, sink_block_pin_index, sink_net_pin_index) = find_pb_route_clb_input_net_pin(clb_sink_block, sink_pb_route_id);
+                if (net_id != ClusterNetId::INVALID() && sink_block_pin_index != -1 && sink_net_pin_index != -1) {
+                    t_trace* rt_root = route_ctx.trace[net_id].head;
+                    int sink_rr_node = route_ctx.net_rr_terminals[net_id][sink_net_pin_index];
+                    auto routed_rr_nodes = trace_routed_connection_rr_nodes(net_id, 0, sink_net_pin_index);
+
+                    fprintf(fp, "\nFrom node : %d   To node: %d  Delay : %f  NetId: %zu From Type : %s To Type : %s",
+                            rt_root->index, sink_rr_node, 1e9 * delay, size_t(net_id), src_name, sink_name);
+                    for (int inode : routed_rr_nodes) {
+                        const auto& rr_node = device_rr_nodes[inode];
+                        if (device_rr_nodes[inode].type() == OPIN) {
+                            fprintf(fp, "\n\tPath OPIN node : %d OPIN side : %s Location : (%d, %d)", inode, rr_node.side_string(), rr_node.xlow(), rr_node.ylow());
+                        } else if (device_rr_nodes[inode].type() == IPIN) {
+                            fprintf(fp, "\n\tPath IPIN node : %d IPIN node: %s Location : (%d, %d)", inode, rr_node.side_string(), rr_node.xlow(), rr_node.ylow());
+                        }
+                    }
+                }
+            }
+            prev_node = node;
+            prev_arr_time = arr_time;
+        }
+        fprintf(fp, "\n\n");
+    }
+}
+
+static void print_route_debug_info(FILE* fp, int itry, std::shared_ptr<SetupTimingInfo> setup_timing_info) {
+    int inode, ilow, jlow, iclass;
+    t_rr_type rr_type;
+    t_trace* tptr;
+
+    tatum::TimingPathCollector path_collector;
+    auto& timing_ctx = g_vpr_ctx.timing();
+    auto& atom_ctx = g_vpr_ctx.atom();
+    auto& place_ctx = g_vpr_ctx.placement();
+    auto& device_ctx = g_vpr_ctx.device();
+    auto& cluster_ctx = g_vpr_ctx.clustering();
+    auto& route_ctx = g_vpr_ctx.mutable_routing();
+
+    fprintf(fp, "Array size: %zu x %zu logic blocks.\n", device_ctx.grid.width(), device_ctx.grid.height());
+    fprintf(fp, "\nRouting iteration %d:", itry);
+    for (auto net_id : cluster_ctx.clb_nlist.nets()) {
+        if (!cluster_ctx.clb_nlist.net_is_global(net_id)) {
+            fprintf(fp, "\n\nNet %zu (%s)\n\n", size_t(net_id), cluster_ctx.clb_nlist.net_name(net_id).c_str());
+            if (cluster_ctx.clb_nlist.net_sinks(net_id).size() == false) {
+                fprintf(fp, "\n\nUsed in local cluster only, reserved one CLB pin\n\n");
+            } else {
+                tptr = route_ctx.trace[net_id].head;
+
+                while (tptr != nullptr) {
+                    inode = tptr->index;
+                    rr_type = device_ctx.rr_nodes[inode].type();
+                    ilow = device_ctx.rr_nodes[inode].xlow();
+                    jlow = device_ctx.rr_nodes[inode].ylow();
+
+                    fprintf(fp, "Node:\t%d\t%6s (%d,%d) ", inode,
+                            device_ctx.rr_nodes[inode].type_string(), ilow, jlow);
+
+                    if ((ilow != device_ctx.rr_nodes[inode].xhigh())
+                        || (jlow != device_ctx.rr_nodes[inode].yhigh()))
+                        fprintf(fp, "to (%d,%d) ", device_ctx.rr_nodes[inode].xhigh(),
+                                device_ctx.rr_nodes[inode].yhigh());
+
+                    switch (rr_type) {
+                        case IPIN:
+                        case OPIN:
+                            if (is_io_type(device_ctx.grid[ilow][jlow].type)) {
+                                fprintf(fp, " Pad: ");
+                            } else { /* IO Pad. */
+                                fprintf(fp, " Pin: ");
+                            }
+                            break;
+
+                        case CHANX:
+                        case CHANY:
+                            fprintf(fp, " Track: ");
+                            break;
+
+                        case SOURCE:
+                        case SINK:
+                            if (is_io_type(device_ctx.grid[ilow][jlow].type)) {
+                                fprintf(fp, " Pad: ");
+                            } else { /* IO Pad. */
+                                fprintf(fp, " Class: ");
+                            }
+                            break;
+
+                        default:
+                            vpr_throw(VPR_ERROR_ROUTE, __FILE__, __LINE__,
+                                      "in print_route: Unexpected traceback element type: %d (%s).\n",
+                                      rr_type, device_ctx.rr_nodes[inode].type_string());
+                            break;
+                    }
+
+                    fprintf(fp, "%d  ", device_ctx.rr_nodes[inode].ptc_num());
+
+                    if (!is_io_type(device_ctx.grid[ilow][jlow].type) && (rr_type == IPIN || rr_type == OPIN)) {
+                        int pin_num = device_ctx.rr_nodes[inode].ptc_num();
+                        int xoffset = device_ctx.grid[ilow][jlow].width_offset;
+                        int yoffset = device_ctx.grid[ilow][jlow].height_offset;
+                        ClusterBlockId iblock = place_ctx.grid_blocks[ilow - xoffset][jlow - yoffset].blocks[0];
+                        VTR_ASSERT(iblock);
+                        t_pb_graph_pin* pb_pin = get_pb_graph_node_pin_from_block_pin(iblock, pin_num);
+                        t_pb_type* pb_type = pb_pin->parent_node->pb_type;
+                        fprintf(fp, " %s.%s[%d] ", pb_type->name, pb_pin->port->name, pb_pin->pin_number);
+                    }
+
+                    /* Uncomment line below if you're debugging and want to see the switch types *
+                     * used in the routing.                                                      */
+                    fprintf(fp, "Switch: %d", tptr->iswitch);
+
+                    fprintf(fp, "\n");
+
+                    tptr = tptr->next;
+                }
+            }
+        }
+
+        else { /* Global net.  Never routed. */
+            fprintf(fp, "\n\nNet %zu (%s): global net connecting:\n\n", size_t(net_id),
+                    cluster_ctx.clb_nlist.net_name(net_id).c_str());
+
+            for (auto pin_id : cluster_ctx.clb_nlist.net_pins(net_id)) {
+                ClusterBlockId block_id = cluster_ctx.clb_nlist.pin_block(pin_id);
+                int pin_index = cluster_ctx.clb_nlist.pin_physical_index(pin_id);
+                iclass = cluster_ctx.clb_nlist.block_type(block_id)->pin_class[pin_index];
+
+                fprintf(fp, "Block %s (#%zu) at (%d,%d), Pin class %d.\n",
+                        cluster_ctx.clb_nlist.block_name(block_id).c_str(), size_t(block_id),
+                        place_ctx.block_locs[block_id].loc.x,
+                        place_ctx.block_locs[block_id].loc.y,
+                        iclass);
+            }
+        }
+    }
+
+    fprintf(fp, "\nCritical path :\n\n:");
+    //Get the worst timing path
+    auto paths = path_collector.collect_worst_setup_timing_paths(*timing_ctx.graph, *(setup_timing_info->setup_analyzer()), 1);
+    tatum::TimingPath path = paths[0];
+    tatum::NodeId prev_node;
+    float prev_arr_time = std::numeric_limits<float>::quiet_NaN();
+    ClusterNetId net_id = ClusterNetId::INVALID();
+
+    for (tatum::TimingPathElem elem : path.data_arrival_path().elements()) {
+        tatum::NodeId node = elem.node();
+        float arr_time = elem.tag().time();
+        if (prev_node) {
+            float delay = arr_time - prev_arr_time;
+
+            AtomPinId atom_sink_pin = atom_ctx.lookup.tnode_atom_pin(node);
+            AtomBlockId atom_sink_block = atom_ctx.nlist.pin_block(atom_sink_pin);
+            ClusterBlockId clb_sink_block = atom_ctx.lookup.atom_clb(atom_sink_block);
+            const t_pb_graph_pin* sink_gpin = atom_ctx.lookup.atom_pin_pb_graph_pin(atom_sink_pin);
+            int sink_pb_route_id = sink_gpin->pin_count_in_cluster;
+            int sink_block_pin_index = -1;
+            int sink_net_pin_index = -1;
+            std::tie(net_id, sink_block_pin_index, sink_net_pin_index) = find_pb_route_clb_input_net_pin(clb_sink_block, sink_pb_route_id);
+            if (net_id != ClusterNetId::INVALID() && sink_block_pin_index != -1 && sink_net_pin_index != -1) {
+                t_trace* rt_root = route_ctx.trace[net_id].head;
+                int sink_rr_node = route_ctx.net_rr_terminals[net_id][sink_net_pin_index];
+
+                fprintf(fp, "\nFrom node : %d   To node: %d  Delay : %f  NetId: %zu", rt_root->index, sink_rr_node, 1e9 * delay, size_t(net_id));
+            }
+        }
+        prev_node = node;
+        prev_arr_time = arr_time;
+    }
+    fprintf(fp, "\n\n");
 }
 
 static void print_route_status(int itry, double elapsed_sec, float pres_fac, int num_bb_updated, const RouterStats& router_stats, const OveruseInfo& overuse_info, const WirelengthInfo& wirelength_info, std::shared_ptr<const SetupHoldTimingInfo> timing_info, float est_success_iteration) {

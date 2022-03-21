@@ -177,6 +177,8 @@ void write_rr_switches(fstream& fp) {
             fp << "\" type=\"pass_gate";
         } else if (rr_switch.type() == SwitchType::SHORT) {
             fp << "\" type=\"short";
+        } else if (rr_switch.type() == SwitchType::UNISHORT) {
+            fp << "\" type=\"unishort";
         } else if (rr_switch.type() == SwitchType::BUFFER) {
             fp << "\" type=\"buffer";
         } else {

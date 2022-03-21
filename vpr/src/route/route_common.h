@@ -92,6 +92,7 @@ void push_back_node(int inode, float total_cost, int prev_node, int prev_edge, f
 bool is_valid();
 void pop_heap();
 void print_heap();
+void pretty_print_heap();
 void verify_extract_top();
 } // namespace heap_
 

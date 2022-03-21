@@ -223,6 +223,8 @@ void process_switches(pugi::xml_node parent, const pugiutil::loc_data& loc_data)
             switch_type = SwitchType::PASS_GATE;
         } else if (switch_type_str == "short") {
             switch_type = SwitchType::SHORT;
+        } else if (switch_type_str == "unishort") {
+            switch_type = SwitchType::UNISHORT;
         } else if (switch_type_str == "buffer") {
             switch_type = SwitchType::BUFFER;
         } else {

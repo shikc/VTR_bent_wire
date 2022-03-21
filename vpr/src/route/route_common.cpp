@@ -1286,6 +1286,14 @@ void print_heap() {
         VTR_LOG("(%e %e %e) ", heap[i]->cost, heap[left(i)]->cost, heap[right(i)]->cost);
     VTR_LOG("\n");
 }
+void pretty_print_heap() {
+    for (int i = 1; i<heap_tail>> 1; ++i)
+        VTR_LOG("[%d(%e) %d(%e) %d(%e)] ", heap[i]->index, heap[i]->cost,
+                         heap[left(i)]->index, heap[left(i)]->cost,
+                         heap[right(i)]->index, heap[right(i)]->cost);
+    VTR_LOG("\n");
+}
+
 // verify correctness of extract top by making a copy, sorting it, and iterating it at the same time as extraction
 void verify_extract_top() {
     constexpr float float_epsilon = 1e-20;

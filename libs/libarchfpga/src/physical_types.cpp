@@ -4,6 +4,7 @@
 
 static bool switch_type_is_buffered(SwitchType type);
 static bool switch_type_is_configurable(SwitchType type);
+static bool switch_type_is_unishort(SwitchType type);
 static e_directionality switch_type_directionaity(SwitchType type);
 
 //Ensure the constant has external linkage to avoid linking errors
@@ -94,7 +95,8 @@ static e_directionality switch_type_directionaity(SwitchType type) {
     } else {
         VTR_ASSERT_SAFE(type == SwitchType::MUX
                         || type == SwitchType::TRISTATE
-                        || type == SwitchType::BUFFER);
+                        || type == SwitchType::BUFFER
+                        || type == SwitchType::UNISHORT);
         //Buffered switches can only drive in one direction
         return e_directionality::UNI_DIRECTIONAL;
     }

@@ -112,6 +112,7 @@ void alloc_and_load_echo_file_info() {
     setEchoFileName(E_ECHO_CHAN_DETAILS, "chan_details.txt");
     setEchoFileName(E_ECHO_SBLOCK_PATTERN, "sblock_pattern.txt");
     setEchoFileName(E_ECHO_ENDPOINT_TIMING, "endpoint_timing.echo.json");
+    setEchoFileName(E_ECHO_CUSTOM_SBLOCK_PATTERN, "custom_sblock_pattern.txt");
 }
 
 void free_echo_file_info() {

@@ -120,6 +120,7 @@ class t_rr_node {
     float C() const;
 
     bool validate() const;
+    bool is_bend_first() const;
 
   public: //Mutators
     void set_type(t_rr_type new_type);
@@ -156,6 +157,7 @@ class t_rr_node {
 
     void set_direction(e_direction);
     void set_side(e_side);
+    void set_bend_first_node(bool);
 
   private: //Types
     //The edge information is stored in a structure to economize on the number of pointers held
@@ -194,6 +196,7 @@ class t_rr_node {
     } ptc_;
     uint16_t fan_in_ = 0;
     uint16_t capacity_ = 0;
+    bool is_bend_first_node = false;
 };
 
 /* Data that is pointed to by the .cost_index member of t_rr_node.  It's     *

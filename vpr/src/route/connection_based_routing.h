@@ -124,6 +124,11 @@ class Connection_based_routing_resources {
                                       std::shared_ptr<const SetupTimingInfo> timing_info,
                                       const ClusteredPinAtomPinsLookup& netlist_pin_lookup,
                                       vtr::vector<ClusterNetId, float*>& net_delay);
+    void forcibly_detailed_reroute(float max_criticality, float criticality_lower_bind,
+							                        std::shared_ptr<const SetupTimingInfo> timing_info,
+							                        const ClusteredPinAtomPinsLookup& netlist_pin_lookup,
+							                        vtr::vector_map<ClusterNetId, float *> &net_delay) ;
+
 };
 
 using CBRR = Connection_based_routing_resources; // shorthand
